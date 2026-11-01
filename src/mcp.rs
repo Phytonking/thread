@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 pub fn serve() -> Result<()> {
-    let thread_id = std::env::var("THREAD_ID").context("THREAD_ID not set (thread mcp is started by the harness)")?;
+    let thread_id = std::env::var("THREAD_ID")
+        .context("THREAD_ID not set (thread mcp is started by the harness)")?;
     let db_path = PathBuf::from(std::env::var("THREAD_DB").context("THREAD_DB not set")?);
     let root = PathBuf::from(std::env::var("THREAD_ROOT").unwrap_or_else(|_| ".".into()));
     let interactive = std::env::var("THREAD_INTERACTIVE").is_ok_and(|v| v == "1");
@@ -28,9 +29,15 @@ pub fn serve() -> Result<()> {
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
-        if line.trim().is_empty() { continue; }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        let Some(id) = msg.get("id").cloned() else { continue }; // notification
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        }; // notification
         let result = match msg["method"].as_str().unwrap_or("") {
             "initialize" => Ok(json!({
                 "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -85,17 +92,32 @@ fn list(is_main: bool) -> Vec<Value> {
 }
 
 /// Claude Code permission-prompt contract: reply {"behavior":"allow","updatedInput":…} or {"behavior":"deny","message":…}.
-fn approve(conn: &rusqlite::Connection, thread_id: &str, interactive: bool, args: &Value) -> String {
+fn approve(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+    interactive: bool,
+    args: &Value,
+) -> String {
     let tool = args["tool_name"].as_str().unwrap_or("a tool");
     let input = args["input"].clone();
     // our own tools are pre-allowed (--allowedTools); this catches any that still get routed here
-    if tool.starts_with("mcp__thread__") || crate::cli::READ_ONLY_TOOLS.contains(&tool) || crate::provider::always_allowed().iter().any(|t| t == tool) { return json!({"behavior": "allow", "updatedInput": input}).to_string(); }
+    if tool.starts_with("mcp__thread__")
+        || crate::cli::READ_ONLY_TOOLS.contains(&tool)
+        || crate::provider::always_allowed().iter().any(|t| t == tool)
+    {
+        return json!({"behavior": "allow", "updatedInput": input}).to_string();
+    }
     let what = describe(tool, &input);
-    let allowed = interactive && threads::request_approval(conn, thread_id, &what)
-        .and_then(|id| threads::wait_approval(conn, id, || {
-            threads::get(conn, thread_id).map(|t| t.status == "stopped").unwrap_or(true)
-        }))
-        .unwrap_or(false);
+    let allowed = interactive
+        && threads::request_approval(conn, thread_id, &what)
+            .and_then(|id| {
+                threads::wait_approval(conn, id, || {
+                    threads::get(conn, thread_id)
+                        .map(|t| t.status == "stopped")
+                        .unwrap_or(true)
+                })
+            })
+            .unwrap_or(false);
     if allowed {
         json!({"behavior": "allow", "updatedInput": input}).to_string()
     } else {
@@ -104,7 +126,9 @@ fn approve(conn: &rusqlite::Connection, thread_id: &str, interactive: bool, args
 }
 
 fn describe(tool: &str, input: &Value) -> String {
-    let detail = ["command", "file_path", "path", "url", "pattern"].iter().find_map(|k| input[*k].as_str());
+    let detail = ["command", "file_path", "path", "url", "pattern"]
+        .iter()
+        .find_map(|k| input[*k].as_str());
     match detail {
         Some(d) => format!("{tool} `{}`", crate::llm::truncate(d, 200)),
         None => format!("{tool} {}", crate::llm::truncate(&input.to_string(), 200)),
@@ -117,9 +141,22 @@ mod tests {
 
     #[test]
     fn lists_harness_tools_and_approve() {
-        let names: Vec<String> = list(true).iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert!(names.contains(&"spawn_thread".into()) && names.contains(&"approve".into()) && names.contains(&"remember".into()));
-        assert!(!names.contains(&"bash".into()), "CLIs bring their own shell");
-        assert_eq!(describe("Bash", &json!({"command": "rm -rf build"})), "Bash `rm -rf build`");
+        let names: Vec<String> = list(true)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            names.contains(&"spawn_thread".into())
+                && names.contains(&"approve".into())
+                && names.contains(&"remember".into())
+        );
+        assert!(
+            !names.contains(&"bash".into()),
+            "CLIs bring their own shell"
+        );
+        assert_eq!(
+            describe("Bash", &json!({"command": "rm -rf build"})),
+            "Bash `rm -rf build`"
+        );
     }
 }

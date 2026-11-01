@@ -37,7 +37,13 @@ impl OpenAiCompat {
             .http_status_as_error(false)
             .build()
             .into();
-        Ok(Self { agent, base_url, api_key, model, effort })
+        Ok(Self {
+            agent,
+            base_url,
+            api_key,
+            model,
+            effort,
+        })
     }
 
     fn post(&self, body: &Value) -> Result<(u16, Value)> {
@@ -45,16 +51,28 @@ impl OpenAiCompat {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let mut req = self.agent.post(&url).header("content-type", "application/json");
-            if let Some(k) = &self.api_key { req = req.header("authorization", &format!("Bearer {k}")); }
+            let mut req = self
+                .agent
+                .post(&url)
+                .header("content-type", "application/json");
+            if let Some(k) = &self.api_key {
+                req = req.header("authorization", &format!("Bearer {k}"));
+            }
             let mut resp = match req.send_json(body) {
                 Ok(r) => r,
-                Err(e) if attempt < 4 => { eprintln!("  (network error, retrying: {e})"); backoff(attempt); continue; }
+                Err(e) if attempt < 4 => {
+                    eprintln!("  (network error, retrying: {e})");
+                    backoff(attempt);
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             };
             let status = resp.status().as_u16();
             let v: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
-            if matches!(status, 429 | 500..=599) && attempt < 4 { backoff(attempt); continue; }
+            if matches!(status, 429 | 500..=599) && attempt < 4 {
+                backoff(attempt);
+                continue;
+            }
             return Ok((status, v));
         }
     }
@@ -62,12 +80,19 @@ impl OpenAiCompat {
 
 impl Llm for OpenAiCompat {
     fn send(&self, body: Value) -> Result<Value> {
-        let model = body["model"].as_str().map(String::from).or_else(|| self.model.clone())
+        let model = body["model"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| self.model.clone())
             .ok_or_else(|| anyhow!("no model chosen for the api provider; pick one with /model"))?;
         let mut req = to_openai(&body, &model);
-        if let Some(e) = &self.effort { req["reasoning_effort"] = json!(e); }
+        if let Some(e) = &self.effort {
+            req["reasoning_effort"] = json!(e);
+        }
         let (status, v) = self.post(&req)?;
-        if status == 200 { return Ok(from_openai(&v)); }
+        if status == 200 {
+            return Ok(from_openai(&v));
+        }
         let msg = err_message(&v);
         // Many compatible servers lack json_schema; fall back to JSON mode with the schema in the prompt.
         if req.get("response_format").is_some() && (400..500).contains(&status) {
@@ -75,10 +100,14 @@ impl Llm for OpenAiCompat {
             req["response_format"] = json!({"type": "json_object"});
             if let Some(first) = req["messages"].as_array_mut().and_then(|m| m.first_mut()) {
                 let sys = first["content"].as_str().unwrap_or("").to_string();
-                first["content"] = json!(format!("{sys}\n\nRespond with only a JSON object matching this JSON Schema:\n{schema}"));
+                first["content"] = json!(format!(
+                    "{sys}\n\nRespond with only a JSON object matching this JSON Schema:\n{schema}"
+                ));
             }
             let (status2, v2) = self.post(&req)?;
-            if status2 == 200 { return Ok(from_openai(&v2)); }
+            if status2 == 200 {
+                return Ok(from_openai(&v2));
+            }
             bail!("api {status2}: {}", err_message(&v2));
         }
         bail!("api {status}: {msg}");
@@ -86,23 +115,36 @@ impl Llm for OpenAiCompat {
 }
 
 fn err_message(v: &Value) -> String {
-    v["error"]["message"].as_str().or(v["error"].as_str()).or(v["message"].as_str()).map(String::from).unwrap_or_else(|| v.to_string())
+    v["error"]["message"]
+        .as_str()
+        .or(v["error"].as_str())
+        .or(v["message"].as_str())
+        .map(String::from)
+        .unwrap_or_else(|| v.to_string())
 }
 
 /// Function schemas for the two Anthropic-defined tools, which have none on the wire.
 fn builtin_schema(kind: &str) -> Option<(&'static str, &'static str, Value)> {
     if kind.starts_with("bash_") {
-        return Some(("bash", "Run a shell command in the thread's working directory. Returns stdout and stderr.", json!({
-            "type": "object", "properties": {"command": {"type": "string"}, "restart": {"type": "boolean"}}, "required": ["command"]})));
+        return Some((
+            "bash",
+            "Run a shell command in the thread's working directory. Returns stdout and stderr.",
+            json!({
+            "type": "object", "properties": {"command": {"type": "string"}, "restart": {"type": "boolean"}}, "required": ["command"]}),
+        ));
     }
     if kind.starts_with("text_editor_") {
-        return Some(("str_replace_based_edit_tool", "View, create and edit files. view: file (with optional view_range [start, end]) or directory. create: path + file_text. str_replace: path + old_str (must match exactly once) + new_str. insert: path + insert_line + insert_text.", json!({
+        return Some((
+            "str_replace_based_edit_tool",
+            "View, create and edit files. view: file (with optional view_range [start, end]) or directory. create: path + file_text. str_replace: path + old_str (must match exactly once) + new_str. insert: path + insert_line + insert_text.",
+            json!({
             "type": "object", "properties": {
                 "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert"]},
                 "path": {"type": "string"}, "file_text": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
                 "insert_line": {"type": "integer"}, "insert_text": {"type": "string"},
                 "view_range": {"type": "array", "items": {"type": "integer"}},
-            }, "required": ["command", "path"]})));
+            }, "required": ["command", "path"]}),
+        ));
     }
     None
 }
@@ -110,7 +152,11 @@ fn builtin_schema(kind: &str) -> Option<(&'static str, &'static str, Value)> {
 fn block_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -119,7 +165,9 @@ fn block_text(v: &Value) -> String {
 /// Internal request -> Chat Completions request.
 pub fn to_openai(body: &Value, model: &str) -> Value {
     let mut msgs = vec![];
-    if let Some(sys) = body["system"].as_str() { msgs.push(json!({"role": "system", "content": sys})); }
+    if let Some(sys) = body["system"].as_str() {
+        msgs.push(json!({"role": "system", "content": sys}));
+    }
     for m in body["messages"].as_array().into_iter().flatten() {
         let role = m["role"].as_str().unwrap_or("user");
         let Some(blocks) = m["content"].as_array() else {
@@ -127,23 +175,45 @@ pub fn to_openai(body: &Value, model: &str) -> Value {
             continue;
         };
         if role == "assistant" {
-            let text: Vec<&str> = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-            let calls: Vec<Value> = blocks.iter().filter(|b| b["type"] == "tool_use").map(|b| json!({
-                "id": b["id"], "type": "function",
-                "function": {"name": b["name"], "arguments": b["input"].to_string()},
-            })).collect();
+            let text: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect();
+            let calls: Vec<Value> = blocks
+                .iter()
+                .filter(|b| b["type"] == "tool_use")
+                .map(|b| {
+                    json!({
+                        "id": b["id"], "type": "function",
+                        "function": {"name": b["name"], "arguments": b["input"].to_string()},
+                    })
+                })
+                .collect();
             let mut out = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text.join("\n")) }});
-            if !calls.is_empty() { out["tool_calls"] = json!(calls); }
+            if !calls.is_empty() {
+                out["tool_calls"] = json!(calls);
+            }
             msgs.push(out);
         } else {
             // tool results first (they must follow the assistant's tool_calls), then any text
             for b in blocks.iter().filter(|b| b["type"] == "tool_result") {
                 let mut content = block_text(&b["content"]);
-                if b["is_error"] == true { content = format!("[error] {content}"); }
-                msgs.push(json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": content}));
+                if b["is_error"] == true {
+                    content = format!("[error] {content}");
+                }
+                msgs.push(
+                    json!({"role": "tool", "tool_call_id": b["tool_use_id"], "content": content}),
+                );
             }
-            let text: Vec<&str> = blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
-            if !text.is_empty() { msgs.push(json!({"role": "user", "content": text.join("\n")})); }
+            let text: Vec<&str> = blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect();
+            if !text.is_empty() {
+                msgs.push(json!({"role": "user", "content": text.join("\n")}));
+            }
         }
     }
     let mut req = json!({"model": model, "messages": msgs});
@@ -154,7 +224,9 @@ pub fn to_openai(body: &Value, model: &str) -> Value {
         let name = t["name"].as_str()?;
         Some(json!({"type": "function", "function": {"name": name, "description": t["description"], "parameters": t["input_schema"]}}))
     }).collect();
-    if !tools.is_empty() { req["tools"] = json!(tools); }
+    if !tools.is_empty() {
+        req["tools"] = json!(tools);
+    }
     let schema = &body["output_config"]["format"]["schema"];
     if !schema.is_null() {
         req["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "output", "schema": schema, "strict": true}});
@@ -169,9 +241,16 @@ pub fn from_openai(v: &Value) -> Value {
     let mut content = vec![];
     // reasoning models on OpenAI-compatible servers (DeepSeek, vLLM, OpenRouter, Ollama…)
     for k in ["reasoning_content", "reasoning"] {
-        if let Some(t) = msg[k].as_str().filter(|t| !t.trim().is_empty()) { content.push(json!({"type": "thinking", "thinking": t})); break; }
+        if let Some(t) = msg[k].as_str().filter(|t| !t.trim().is_empty()) {
+            content.push(json!({"type": "thinking", "thinking": t}));
+            break;
+        }
     }
-    if let Some(t) = msg["content"].as_str() { if !t.is_empty() { content.push(json!({"type": "text", "text": t})); } }
+    if let Some(t) = msg["content"].as_str()
+        && !t.is_empty()
+    {
+        content.push(json!({"type": "text", "text": t}));
+    }
     let calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
     for c in &calls {
         let args = c["function"]["arguments"].as_str().unwrap_or("{}");
@@ -205,35 +284,58 @@ pub struct Scripted {
 #[cfg(test)]
 impl Scripted {
     pub fn new(responses: Vec<Value>) -> Self {
-        Self { responses: Mutex::new(responses.into()), requests: Mutex::new(vec![]) }
+        Self {
+            responses: Mutex::new(responses.into()),
+            requests: Mutex::new(vec![]),
+        }
     }
     pub fn text(s: &str) -> Value {
         json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": s}], "usage": {"input_tokens": 10, "output_tokens": 10}})
     }
-    pub fn json(v: Value) -> Value { Self::text(&v.to_string()) }
+    pub fn json(v: Value) -> Value {
+        Self::text(&v.to_string())
+    }
 }
 
 #[cfg(test)]
 impl Llm for Scripted {
     fn send(&self, body: Value) -> Result<Value> {
         self.requests.lock().unwrap().push(body);
-        self.responses.lock().unwrap().pop_front().ok_or_else(|| anyhow!("scripted llm exhausted"))
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| anyhow!("scripted llm exhausted"))
     }
 }
 
 // ---- response helpers ----
 
 pub fn text_of(resp: &Value) -> String {
-    resp["content"].as_array().map(|blocks| {
-        blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("")
-    }).unwrap_or_default()
+    resp["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
 }
 
 /// Total prompt size the model saw on this request.
 pub fn context_tokens(resp: &Value) -> u64 {
     let u = &resp["usage"];
-    ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-        .iter().map(|k| u[*k].as_u64().unwrap_or(0)).sum()
+    [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .map(|k| u[*k].as_u64().unwrap_or(0))
+    .sum()
 }
 
 /// One-shot structured call: a single user prompt, response constrained to `schema`.
@@ -251,13 +353,18 @@ pub fn parse_structured(resp: &Value) -> Result<Value> {
         bail!("model declined the request");
     }
     let text = text_of(resp);
-    serde_json::from_str(&text).with_context(|| format!("model returned non-JSON: {}", truncate(&text, 200)))
+    serde_json::from_str(&text)
+        .with_context(|| format!("model returned non-JSON: {}", truncate(&text, 200)))
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { return s.to_string(); }
+    if s.len() <= max {
+        return s.to_string();
+    }
     let mut end = max;
-    while !s.is_char_boundary(end) { end -= 1; }
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}…[{} more bytes]", &s[..end], s.len() - end)
 }
 
@@ -282,13 +389,25 @@ mod tests {
         let r = to_openai(&body, "gpt-x");
         let m = r["messages"].as_array().unwrap();
         assert_eq!(m[0], json!({"role": "system", "content": "sys"}));
-        assert_eq!(m[2]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(
+            m[2]["tool_calls"][0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
         assert_eq!(m[2]["content"], "checking");
-        assert_eq!(m[3], json!({"role": "tool", "tool_call_id": "c1", "content": "a.txt"}));
-        assert_eq!(m[4], json!({"role": "user", "content": "[from main] hurry"}));
+        assert_eq!(
+            m[3],
+            json!({"role": "tool", "tool_call_id": "c1", "content": "a.txt"})
+        );
+        assert_eq!(
+            m[4],
+            json!({"role": "user", "content": "[from main] hurry"})
+        );
         assert_eq!(r["tools"][0]["function"]["name"], "bash");
         assert!(r["tools"][0]["function"]["parameters"]["properties"]["command"].is_object());
-        assert_eq!(r["tools"][1]["function"]["parameters"], json!({"type": "object"}));
+        assert_eq!(
+            r["tools"][1]["function"]["parameters"],
+            json!({"type": "object"})
+        );
         assert_eq!(r["response_format"]["type"], "json_schema");
     }
 
@@ -299,9 +418,17 @@ mod tests {
             "usage": {"prompt_tokens": 120, "completion_tokens": 7}});
         let r = from_openai(&v);
         assert_eq!(r["stop_reason"], "tool_use");
-        assert_eq!(r["content"][0], json!({"type": "tool_use", "id": "c9", "name": "remember", "input": {"entity": "x"}}));
+        assert_eq!(
+            r["content"][0],
+            json!({"type": "tool_use", "id": "c9", "name": "remember", "input": {"entity": "x"}})
+        );
         assert_eq!(context_tokens(&r), 120);
-        let r = from_openai(&json!({"choices": [{"finish_reason": "stop", "message": {"content": "done"}}]}));
-        assert_eq!((r["stop_reason"].as_str(), text_of(&r).as_str()), (Some("end_turn"), "done"));
+        let r = from_openai(
+            &json!({"choices": [{"finish_reason": "stop", "message": {"content": "done"}}]}),
+        );
+        assert_eq!(
+            (r["stop_reason"].as_str(), text_of(&r).as_str()),
+            (Some("end_turn"), "done")
+        );
     }
 }
