@@ -132,11 +132,19 @@ pub fn open(path: &Path) -> Result<Connection> {
 
 /// Columns added after a database may already exist.
 fn migrate(conn: &Connection) -> Result<()> {
-    let cols: Vec<String> = conn.prepare("SELECT name FROM pragma_table_info('threads')")?
-        .query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    if !cols.iter().any(|c| c == "provider") { conn.execute_batch("ALTER TABLE threads ADD COLUMN provider TEXT NOT NULL DEFAULT ''")?; }
-    if !cols.iter().any(|c| c == "session") { conn.execute_batch("ALTER TABLE threads ADD COLUMN session TEXT")?; }
-    if !cols.iter().any(|c| c == "model") { conn.execute_batch("ALTER TABLE threads ADD COLUMN model TEXT")?; }
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('threads')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !cols.iter().any(|c| c == "provider") {
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN provider TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !cols.iter().any(|c| c == "session") {
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN session TEXT")?;
+    }
+    if !cols.iter().any(|c| c == "model") {
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN model TEXT")?;
+    }
     Ok(())
 }
 
@@ -148,21 +156,37 @@ pub fn open_memory() -> Connection {
 }
 
 pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// Short id: 6 base36 chars from time, pid and a counter.
 pub fn new_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    let mut x = nanos ^ ((std::process::id() as u64) << 40) ^ COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let mut x = nanos
+        ^ ((std::process::id() as u64) << 40)
+        ^ COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E3779B97F4A7C15);
     // splitmix finalizer so consecutive ids don't share prefixes
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
     x ^= x >> 31;
     let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    (0..6).map(|_| { let c = alphabet[(x % 36) as usize] as char; x /= 36; c }).collect()
+    (0..6)
+        .map(|_| {
+            let c = alphabet[(x % 36) as usize] as char;
+            x /= 36;
+            c
+        })
+        .collect()
 }
 
 pub fn audit(conn: &Connection, kind: &str, r#ref: &str, detail: &str) -> Result<()> {
@@ -176,11 +200,17 @@ pub fn audit(conn: &Connection, kind: &str, r#ref: &str, detail: &str) -> Result
 /// Replace the FTS row for (kind, ref).
 pub fn index(conn: &Connection, kind: &str, r#ref: &str, text: &str) -> Result<()> {
     unindex(conn, kind, r#ref)?;
-    conn.execute("INSERT INTO recall_fts (kind, ref, text) VALUES (?1, ?2, ?3)", rusqlite::params![kind, r#ref, text])?;
+    conn.execute(
+        "INSERT INTO recall_fts (kind, ref, text) VALUES (?1, ?2, ?3)",
+        rusqlite::params![kind, r#ref, text],
+    )?;
     Ok(())
 }
 
 pub fn unindex(conn: &Connection, kind: &str, r#ref: &str) -> Result<()> {
-    conn.execute("DELETE FROM recall_fts WHERE kind = ?1 AND ref = ?2", rusqlite::params![kind, r#ref])?;
+    conn.execute(
+        "DELETE FROM recall_fts WHERE kind = ?1 AND ref = ?2",
+        rusqlite::params![kind, r#ref],
+    )?;
     Ok(())
 }

@@ -7,38 +7,77 @@ use std::process::{Command, Stdio};
 
 /// Pick one of `items`. `None` means the user cancelled.
 pub fn pick(title: &str, items: &[String], start: usize) -> Result<Option<usize>> {
-    if items.is_empty() { return Ok(None); }
-    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
-        if let Some(raw) = Raw::enter() { return interactive(title, items, start.min(items.len() - 1), raw); }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    if std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+        && let Some(raw) = Raw::enter()
+    {
+        return interactive(title, items, start.min(items.len() - 1), raw);
     }
     numbered(title, items)
 }
 
 fn numbered(title: &str, items: &[String]) -> Result<Option<usize>> {
     eprintln!("{title}");
-    for (i, it) in items.iter().enumerate() { eprintln!("{:>3}. {it}", i + 1); }
+    for (i, it) in items.iter().enumerate() {
+        eprintln!("{:>3}. {it}", i + 1);
+    }
     eprint!("\x1b[2mnumber (enter to cancel):\x1b[0m ");
     std::io::stderr().flush().ok();
-    let line = match crate::input::read_line()? { crate::input::Input::Line(l) => l, _ => return Ok(None) };
-    Ok(line.trim().parse::<usize>().ok().filter(|n| (1..=items.len()).contains(n)).map(|n| n - 1))
+    let line = match crate::input::read_line()? {
+        crate::input::Input::Line(l) => l,
+        _ => return Ok(None),
+    };
+    Ok(line
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=items.len()).contains(n))
+        .map(|n| n - 1))
 }
 
-fn interactive(title: &str, items: &[String], mut sel: usize, mut raw: Raw) -> Result<Option<usize>> {
+fn interactive(
+    title: &str,
+    items: &[String],
+    mut sel: usize,
+    mut raw: Raw,
+) -> Result<Option<usize>> {
     let mut err = std::io::stderr();
     let (rows, cols) = size();
     // every row must be exactly one terminal line, or redrawing walks up too few lines
     let width = cols.saturating_sub(3).max(10);
     let shown = items.len().min(rows.saturating_sub(2).max(3));
     let mut top = 0;
-    let more = if shown < items.len() { format!(" {}/{}", shown, items.len()) } else { String::new() };
+    let more = if shown < items.len() {
+        format!(" {}/{}", shown, items.len())
+    } else {
+        String::new()
+    };
     write!(err, "\x1b[?7l").ok();
     let mut draw = |err: &mut std::io::Stderr, sel: usize, first: bool| {
-        if sel < top { top = sel; } else if sel >= top + shown { top = sel + 1 - shown; }
-        if !first { write!(err, "\x1b[{}A", shown + 1).ok(); }
-        write!(err, "\r\x1b[J{} \x1b[2m(↑/↓ enter · esc to cancel){more}\x1b[0m\r\n", clip(title, width)).ok();
+        if sel < top {
+            top = sel;
+        } else if sel >= top + shown {
+            top = sel + 1 - shown;
+        }
+        if !first {
+            write!(err, "\x1b[{}A", shown + 1).ok();
+        }
+        write!(
+            err,
+            "\r\x1b[J{} \x1b[2m(↑/↓ enter · esc to cancel){more}\x1b[0m\r\n",
+            clip(title, width)
+        )
+        .ok();
         for (i, it) in items.iter().enumerate().skip(top).take(shown) {
             let it = clip(it, width);
-            if i == sel { write!(err, "\x1b[36m▸ {it}\x1b[0m\r\n").ok(); } else { write!(err, "  {it}\r\n").ok(); }
+            if i == sel {
+                write!(err, "\x1b[36m▸ {it}\x1b[0m\r\n").ok();
+            } else {
+                write!(err, "  {it}\r\n").ok();
+            }
         }
         err.flush().ok();
     };
@@ -47,7 +86,11 @@ fn interactive(title: &str, items: &[String], mut sel: usize, mut raw: Raw) -> R
         match raw.key() {
             Key::Up => sel = sel.checked_sub(1).unwrap_or(items.len() - 1),
             Key::Down => sel = (sel + 1) % items.len(),
-            Key::Digit(d) if (1..=items.len()).contains(&d) => { sel = d - 1; draw(&mut err, sel, false); break Some(sel); }
+            Key::Digit(d) if (1..=items.len()).contains(&d) => {
+                sel = d - 1;
+                draw(&mut err, sel, false);
+                break Some(sel);
+            }
             Key::Enter => break Some(sel),
             Key::Cancel => break None,
             _ => continue,
@@ -62,32 +105,50 @@ fn interactive(title: &str, items: &[String], mut sel: usize, mut raw: Raw) -> R
 
 /// Terminal (rows, columns).
 fn size() -> (usize, usize) {
-    stty(&["size"]).and_then(|s| {
-        let mut it = s.split_whitespace().filter_map(|n| n.parse().ok());
-        Some((it.next()?, it.next()?))
-    }).filter(|&(r, c)| r > 0 && c > 0).unwrap_or((24, 80))
+    stty(&["size"])
+        .and_then(|s| {
+            let mut it = s.split_whitespace().filter_map(|n| n.parse().ok());
+            Some((it.next()?, it.next()?))
+        })
+        .filter(|&(r, c)| r > 0 && c > 0)
+        .unwrap_or((24, 80))
 }
 
 /// At most `width` characters, with `…` when cut.
 fn clip(s: &str, width: usize) -> String {
     let s = s.replace(['\n', '\r', '\t'], " ");
-    if s.chars().count() <= width { return s; }
+    if s.chars().count() <= width {
+        return s;
+    }
     let mut out: String = s.chars().take(width - 1).collect();
     out.push('…');
     out
 }
 
-enum Key { Up, Down, Enter, Cancel, Digit(usize), Other }
+enum Key {
+    Up,
+    Down,
+    Enter,
+    Cancel,
+    Digit(usize),
+    Other,
+}
 
 /// The terminal in no-echo, unbuffered mode; restored on drop.
-struct Raw { saved: String, tty: std::fs::File }
+struct Raw {
+    saved: String,
+    tty: std::fs::File,
+}
 
 impl Raw {
     fn enter() -> Option<Raw> {
         let saved = stty(&["-g"])?;
         stty(&["-icanon", "-echo", "-isig", "min", "0", "time", "1"])?;
         let tty = std::fs::File::open("/dev/tty").ok()?;
-        Some(Raw { saved: saved.trim().to_string(), tty })
+        Some(Raw {
+            saved: saved.trim().to_string(),
+            tty,
+        })
     }
 
     /// Next byte, waiting for one. `None` after a short pause (lone Esc).
@@ -121,11 +182,20 @@ impl Raw {
 }
 
 impl Drop for Raw {
-    fn drop(&mut self) { stty(&[&self.saved]); }
+    fn drop(&mut self) {
+        stty(&[&self.saved]);
+    }
 }
 
 fn stty(args: &[&str]) -> Option<String> {
     let tty = std::fs::File::open("/dev/tty").ok()?;
-    let out = Command::new("stty").args(args).stdin(tty).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let out = Command::new("stty")
+        .args(args)
+        .stdin(tty)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
