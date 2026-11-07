@@ -19,3 +19,19 @@ Feature: One-shot runs
     Then the command succeeds
     And the output contains "echo: [from latecomer] finished"
     And thread "main" has no live run
+
+  Scenario: Ask finishes promptly when every handoff request fails
+    When I run "thread ask 'spawn thread fragile: a broken handoff' --yolo" with a 30 second limit
+    Then the command succeeds
+    And the output contains "✗ [fragile] handoff failed"
+    And the output contains "✓ [fragile] finished (partial)"
+    And the output contains "echo: [from fragile] finished (partial)"
+    And the model received "the handoff summary failed; the report follows" in the conversation
+    And no thread has a live run
+
+  Scenario: Ask finishes promptly when the handoff answers prose instead of JSON
+    When I run "thread ask 'spawn thread mumbler: a garbled handoff' --yolo" with a 30 second limit
+    Then the command succeeds
+    And the output contains "✗ [mumbler] handoff failed"
+    And the output contains "echo: [from mumbler] finished (partial)"
+    And no thread has a live run

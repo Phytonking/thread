@@ -58,6 +58,9 @@ pub struct Runtime {
     /// Clients for local-model providers (ollama, fm, local), built on first use.
     pub local_llms: Mutex<HashMap<Provider, Arc<dyn Llm>>>,
     workers: Mutex<HashMap<String, Worker>>,
+    /// Threads whose run could not be closed (even the fallback seal failed). Shutdown stops
+    /// waiting on them instead of re-requesting a seal that cannot succeed.
+    unsealable: Mutex<HashSet<String>>,
     focus: Mutex<String>,
 }
 
@@ -108,6 +111,7 @@ impl Runtime {
             shell_notes: Mutex::new(HashMap::new()),
             local_llms: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
+            unsealable: Mutex::new(HashSet::new()),
             focus: Mutex::new(MAIN.to_string()),
         })
     }
@@ -466,8 +470,8 @@ impl Runtime {
                 let running = threads::get(conn, &id)
                     .map(|t| t.status == "running")
                     .unwrap_or(false);
-                if running {
-                    continue;
+                if running || self.unsealable.lock().unwrap().contains(&id) {
+                    continue; // left to resume next launch
                 }
                 if threads::live_run(conn, &id).ok().flatten().is_some() {
                     self.request_seal(&id); // idempotent: sets a flag and wakes the worker
@@ -537,10 +541,8 @@ fn worker_loop(
         // Moved to another provider (by /provider here, or by main's set_thread_model through the MCP
         // server): hand off and exit; the next message starts a worker on the new provider.
         if rt.provider_of(&threads::get(&conn, id)?) != provider {
-            if agent.run_id.is_some()
-                && let Err(e) = finish_run(rt, &conn, &mut agent, "")
-            {
-                rt.notice(&format!("✗ [{id}] handoff failed: {e:#}"));
+            if agent.run_id.is_some() {
+                close_run(rt, &conn, &mut agent, "");
             }
             return Ok(());
         }
@@ -555,13 +557,11 @@ fn worker_loop(
                 Ok(Step::Idle(text)) => {
                     // Stay "running" through the handoff: its report has not reached main yet, so
                     // the thread is not settled (wait_idle would otherwise let `ask` shut down early).
-                    let handed_off = if id != MAIN && rt.focus() != id {
-                        finish_run(rt, &conn, &mut agent, &text)
-                    } else {
-                        Ok(())
-                    };
+                    // A failed handoff is reported, not fatal: the worker must outlive it.
+                    if id != MAIN && rt.focus() != id {
+                        close_run(rt, &conn, &mut agent, &text);
+                    }
                     threads::set_status(&conn, id, "idle")?;
-                    handed_off?;
                     if rt.focus() == id {
                         rt.prompt();
                     }
@@ -581,11 +581,8 @@ fn worker_loop(
             }
             continue;
         }
-        if seal.swap(false, Ordering::Relaxed)
-            && agent.run_id.is_some()
-            && let Err(e) = finish_run(rt, &conn, &mut agent, "")
-        {
-            rt.notice(&format!("✗ [{id}] handoff failed: {e:#}"));
+        if seal.swap(false, Ordering::Relaxed) && agent.run_id.is_some() {
+            close_run(rt, &conn, &mut agent, "");
         }
         if reload.load(Ordering::Relaxed) {
             return Ok(());
@@ -594,6 +591,22 @@ fn worker_loop(
             return Ok(());
         }
         while wake.try_recv().is_ok() {} // coalesce repeated wakes
+    }
+}
+
+/// End the agent's run and report it, never failing: errors become notices. If the run is still
+/// open afterwards (even the fallback seal failed), the thread is marked unsealable so shutdown
+/// doesn't wait on it; the run resumes next launch.
+fn close_run(rt: &Arc<Runtime>, conn: &Connection, agent: &mut Agent, final_text: &str) {
+    let id = agent.thread.id.clone();
+    if let Err(e) = finish_run(rt, conn, agent, final_text) {
+        rt.notice(&format!("✗ [{id}] handoff failed: {e:#}"));
+    }
+    let mut stuck = rt.unsealable.lock().unwrap();
+    if agent.run_id.is_some() {
+        stuck.insert(id);
+    } else {
+        stuck.remove(&id);
     }
 }
 
@@ -607,6 +620,12 @@ fn finish_run(
     let Some(h) = agent.handoff()? else {
         return Ok(());
     };
+    if let Some(e) = &h.error {
+        rt.notice(&format!(
+            "✗ [{id}] handoff failed, run closed with its last output as the summary: {}",
+            llm::truncate(e, 300)
+        ));
+    }
     if id != MAIN {
         let outcome = h.outcome.unwrap_or_else(|| "partial".into());
         rt.notice(&format!(
@@ -614,13 +633,18 @@ fn finish_run(
             llm::truncate(&h.summary, 200)
         ));
         if !final_text.is_empty() {
+            // Without a handoff the summary is the report itself; don't repeat it.
+            let summary = if h.error.is_some() {
+                "(the handoff summary failed; the report follows)"
+            } else {
+                h.summary.as_str()
+            };
             rt.deliver(
                 conn,
                 MAIN,
                 &id,
                 &format!(
-                    "finished ({outcome}): {}\n\nReport:\n{}",
-                    h.summary,
+                    "finished ({outcome}): {summary}\n\nReport:\n{}",
                     llm::truncate(final_text, 3000)
                 ),
             )?;
@@ -966,6 +990,49 @@ mod tests {
             "root cause found"
         );
         assert_eq!(threads::get(&conn, MAIN).unwrap().status, "idle");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn failed_handoffs_still_report_and_let_shutdown_finish() {
+        let root = tmp_root();
+        let db_path = root.join(".thread/thread.db");
+        let conn = db::open(&db_path).unwrap();
+        threads::ensure_main(&conn, &root.display().to_string()).unwrap();
+        let work = Arc::new(Scripted::new(vec![
+            Scripted::text("Investigated: the cache key ignores locale."),
+            // the bg handoff fails twice (prose, not JSON): the run closes with a fallback
+            Scripted::text("Sure, here's the handoff!"),
+            Scripted::text("Sure, here's the handoff!"),
+            // main wakes on the report
+            Scripted::text("noted"),
+            // main's own handoff at shutdown then fails too (the script is exhausted)
+        ]));
+        let mem = Arc::new(Scripted::new(vec![]));
+        let mut rt = Runtime::new(db_path, root.clone(), work.clone(), mem, false, false);
+        Arc::get_mut(&mut rt).unwrap().quiet = true;
+        rt.spawn_thread(&conn, "cache-bug", "find the bug", false, MAIN, "", None)
+            .unwrap();
+        assert!(rt.wait_idle(&conn, Duration::from_secs(10)).unwrap());
+        let reqs = work.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 4, "task, handoff, its retry, main's reaction");
+        let main_req = reqs[3]["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            main_req.contains("[from cache-bug] finished (partial)")
+                && main_req.contains("Report:\nInvestigated: the cache key ignores locale."),
+            "{main_req}"
+        );
+        drop(reqs);
+        assert!(threads::live_run(&conn, "cache-bug").unwrap().is_none());
+        assert!(threads::live_run(&conn, MAIN).unwrap().is_some());
+        let start = Instant::now();
+        rt.shutdown(&conn, Duration::from_secs(30)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(threads::live_run(&conn, MAIN).unwrap().is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 

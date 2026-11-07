@@ -43,6 +43,8 @@ pub enum Step {
 pub struct Handoff {
     pub outcome: Option<String>,
     pub summary: String,
+    /// Set when the model's handoff failed and the run was closed with a fallback summary.
+    pub error: Option<String>,
 }
 
 fn main_system(root: &str) -> String {
@@ -566,10 +568,56 @@ impl<'a> Agent<'a> {
     }
 
     /// End the current run: handoff, learn, seal. None if there was no run.
+    ///
+    /// The run always ends: if the model's handoff fails twice (a request error, tool calls or
+    /// non-JSON instead of the summary), the run is sealed with its last output as the summary and
+    /// the failure is reported in `Handoff::error`. A run left live would never settle, and
+    /// shutdown would wait on it forever.
     pub fn handoff(&mut self) -> Result<Option<Handoff>> {
         let Some(run) = self.run_id.clone() else {
             return Ok(None);
         };
+        let mut err = match self.try_handoff(&run) {
+            Ok(h) => return Ok(h),
+            Err(e) => e,
+        };
+        if self.run_id.as_deref() != Some(run.as_str()) {
+            return Err(err); // sealed already; the failure came after
+        }
+        if !self.cancel.load(Ordering::Relaxed) {
+            (self.echo)(Echo::Info("handoff failed; retrying once"));
+            match self.try_handoff(&run) {
+                Ok(h) => return Ok(h),
+                Err(e) if self.run_id.as_deref() != Some(run.as_str()) => return Err(e),
+                Err(e) => err = e,
+            }
+        }
+        self.seal_fallback(&run, &format!("{err:#}")).map(Some)
+    }
+
+    /// Close a run whose handoff failed, keeping its last output as the summary.
+    fn seal_fallback(&mut self, run: &str, error: &str) -> Result<Handoff> {
+        let last = threads::last_assistant_text(self.conn, run)?;
+        let summary = if last.trim().is_empty() {
+            "(no summary: the handoff failed)".to_string()
+        } else {
+            llm::truncate(last.trim(), 1000)
+        };
+        let task_type = if self.is_main() { "main" } else { "general" };
+        threads::log_event(self.conn, run, "handoff_failed", None, true, error)?;
+        threads::seal_run(self.conn, run, None, task_type, &summary)?;
+        self.skills_offered.clear();
+        self.run_id = None;
+        self.fresh = true;
+        Ok(Handoff {
+            outcome: None,
+            summary,
+            error: Some(error.to_string()),
+        })
+    }
+
+    fn try_handoff(&mut self, run: &str) -> Result<Option<Handoff>> {
+        let run = run.to_string();
         if self.is_cli() {
             return self.handoff_cli(&run);
         }
@@ -636,7 +684,11 @@ impl<'a> Agent<'a> {
         self.skills_offered.clear();
         self.run_id = None;
         self.fresh = true; // the next run re-reads memory
-        Ok(Some(Handoff { outcome, summary }))
+        Ok(Some(Handoff {
+            outcome,
+            summary,
+            error: None,
+        }))
     }
 
     fn perms(&self) -> Perms {
@@ -895,6 +947,77 @@ mod tests {
         // the conversation itself survives for follow-ups
         let (msgs, _) = threads::load_messages(&c, "billing-pg").unwrap();
         assert!(!msgs.is_empty());
+    }
+
+    fn bg_thread_with_mail(c: &Connection) {
+        threads::ensure_main(c, "/repo").unwrap();
+        threads::create(c, "probe", "look around", "/repo", None, Some("main"), "").unwrap();
+        threads::send(c, "probe", "main", "look around").unwrap();
+    }
+
+    #[test]
+    fn failed_handoff_retries_once_then_seals_with_the_last_output() {
+        let c = db::open_memory();
+        bg_thread_with_mail(&c);
+        let llm = Scripted::new(vec![
+            Scripted::text("Found it: the config is stale."),
+            // the handoff answers tool calls, then prose: never the JSON object
+            tool_use("bash", json!({"command": "ls"})),
+            Scripted::text("Here's my summary!"),
+        ]);
+        let mut a = agent(&c, &llm, "probe");
+        a.step().unwrap();
+        let run = a.run_id.clone().unwrap();
+        let h = a.handoff().unwrap().unwrap();
+        assert!(
+            h.error.as_deref().unwrap().contains("non-JSON"),
+            "{:?}",
+            h.error
+        );
+        assert_eq!(h.outcome, None);
+        assert_eq!(h.summary, "Found it: the config is stale.");
+        assert_eq!(
+            llm.requests.lock().unwrap().len(),
+            3,
+            "turn, handoff, one retry"
+        );
+        assert!(a.run_id.is_none());
+        assert!(threads::live_run(&c, "probe").unwrap().is_none());
+        let summary: String = c
+            .query_row("SELECT summary FROM runs WHERE id = ?1", [&run], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(summary, "Found it: the config is stale.");
+        // a request error (the script is exhausted) closes the run the same way
+        threads::send(&c, "probe", "main", "again").unwrap();
+        let llm = Scripted::new(vec![Scripted::text("ok")]);
+        let mut a = agent(&c, &llm, "probe");
+        a.step().unwrap();
+        let h = a.handoff().unwrap().unwrap();
+        assert!(h.error.unwrap().contains("exhausted"));
+        assert!(threads::live_run(&c, "probe").unwrap().is_none());
+    }
+
+    #[test]
+    fn handoff_retry_can_succeed() {
+        let c = db::open_memory();
+        bg_thread_with_mail(&c);
+        let llm = Scripted::new(vec![
+            Scripted::text("done"),
+            Scripted::text("not json"),
+            Scripted::json(
+                json!({"state": "s", "outcome": "success", "task_type": "probe", "summary": "Looked around.", "facts": []}),
+            ),
+        ]);
+        let mut a = agent(&c, &llm, "probe");
+        a.step().unwrap();
+        let h = a.handoff().unwrap().unwrap();
+        assert!(h.error.is_none());
+        assert_eq!(
+            (h.outcome.as_deref(), h.summary.as_str()),
+            (Some("success"), "Looked around.")
+        );
     }
 
     #[test]

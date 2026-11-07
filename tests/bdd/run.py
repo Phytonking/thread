@@ -356,6 +356,14 @@ def _(w, name):
     live = w.db().execute("SELECT id FROM runs WHERE thread_id = ? AND ended_at IS NULL", (name,)).fetchall()
     assert not live, f"live runs left on {name}: {[r[0] for r in live]}"
 
+@step(r"no thread has a live run")
+def _(w):
+    live = w.db().execute("SELECT thread_id, id FROM runs WHERE ended_at IS NULL").fetchall()
+    assert not live, f"live runs left: {live}"
+
+@step(r'the output does not contain "(.*)"')
+def _(w, text): assert text not in w.last[1], f'"{text}" in output'
+
 @step(r'thread "([^"]+)" exists')
 def _(w, thread):
     assert w.db().execute("SELECT 1 FROM threads WHERE id = ?", (thread,)).fetchone(), f"no thread {thread}"
