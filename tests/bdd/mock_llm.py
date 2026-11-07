@@ -13,6 +13,8 @@ like <repo>, <thread>, <memory> are stripped first):
     remember <entity> <attribute> <value>     calls remember, then echoes the tool's answer
     a task containing "slow"                  background thread waits 8s before its first reply
     a task containing "late report"           background thread's handoff takes 4s (its report reaches main late)
+    a conversation containing "broken handoff"   handoffs (main's and threads') fail with HTTP 500
+    a conversation containing "garbled handoff"  handoffs answer prose instead of JSON
     a background thread's first task          calls bash `pwd`, then replies "Report: done"
     anything else                             "echo: <text>"
     json_schema requests (nap, handoff)       a valid object for the schema
@@ -45,9 +47,18 @@ def reply(content=None, calls=None):
 def call(name, args):
     return [{"id": f"c{time.time_ns()}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]
 
+HANDOFF = ("This run is ending", "The user is stepping away")
+
 def respond(body):
     if "notools" in (body.get("model") or "") and body.get("tools"):
         return 400, {"error": f"registry.ollama.ai/library/{body['model']} does not support tools"}
+    msgs = body["messages"]
+    if body.get("response_format") and any(h in text_of(msgs[-1].get("content")) for h in HANDOFF):
+        convo = "\n".join(text_of(x.get("content")) for x in msgs)
+        if "broken handoff" in convo:
+            return 500, {"error": "mock: handoff exploded"}
+        if "garbled handoff" in convo:
+            return 200, reply("Sure! Here is how things stand: all good.")
     return 200, script(body)
 
 def script(body):

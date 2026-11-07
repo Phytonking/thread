@@ -312,6 +312,18 @@ pub fn log_event(
     Ok(())
 }
 
+/// The last thing the model said in a run (empty if it said nothing).
+pub fn last_assistant_text(conn: &Connection, run_id: &str) -> Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT body FROM events WHERE run_id = ?1 AND kind = 'assistant' ORDER BY id DESC LIMIT 1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
 pub fn seal_run(
     conn: &Connection,
     run_id: &str,
