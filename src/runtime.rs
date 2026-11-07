@@ -433,26 +433,27 @@ impl Runtime {
     }
 
     /// Hand off every idle thread's live run, then return. Running threads are left to resume next launch.
+    /// Re-checked on every pass: mail that lands mid-shutdown (e.g. a late report) starts a new run on
+    /// an idle thread, and that run must be handed off too.
     pub fn shutdown(&self, conn: &Connection, timeout: Duration) -> Result<()> {
-        let idle_with_run: Vec<String> = self
-            .alive()
-            .into_iter()
-            .filter(|id| {
-                threads::get(conn, id)
-                    .map(|t| t.status != "running")
-                    .unwrap_or(false)
-            })
-            .filter(|id| threads::live_run(conn, id).ok().flatten().is_some())
-            .collect();
-        for id in &idle_with_run {
-            self.request_seal(id);
-        }
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if idle_with_run
-                .iter()
-                .all(|id| threads::live_run(conn, id).ok().flatten().is_none())
-            {
+            let mut unsettled = false;
+            for id in self.alive() {
+                let running = threads::get(conn, &id)
+                    .map(|t| t.status == "running")
+                    .unwrap_or(false);
+                if running {
+                    continue;
+                }
+                if threads::live_run(conn, &id).ok().flatten().is_some() {
+                    self.request_seal(&id); // idempotent: sets a flag and wakes the worker
+                    unsettled = true;
+                } else if threads::has_wake_mail(conn, &id).unwrap_or(false) {
+                    unsettled = true; // about to start a run that will need handing off
+                }
+            }
+            if !unsettled {
                 break;
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -526,10 +527,15 @@ fn worker_loop(
             threads::set_status(&conn, id, "running")?;
             match agent.step() {
                 Ok(Step::Idle(text)) => {
+                    // Stay "running" through the handoff: its report has not reached main yet, so
+                    // the thread is not settled (wait_idle would otherwise let `ask` shut down early).
+                    let handed_off = if id != MAIN && rt.focus() != id {
+                        finish_run(rt, &conn, &mut agent, &text)
+                    } else {
+                        Ok(())
+                    };
                     threads::set_status(&conn, id, "idle")?;
-                    if id != MAIN && rt.focus() != id {
-                        finish_run(rt, &conn, &mut agent, &text)?;
-                    }
+                    handed_off?;
                     if rt.focus() == id {
                         rt.prompt();
                     }

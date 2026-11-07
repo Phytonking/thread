@@ -12,6 +12,7 @@ like <repo>, <thread>, <memory> are stripped first):
     run: <shell command>                      calls bash, then replies "ran: <output>" (or "denied: ...")
     remember <entity> <attribute> <value>     calls remember, then echoes the tool's answer
     a task containing "slow"                  background thread waits 8s before its first reply
+    a task containing "late report"           background thread's handoff takes 4s (its report reaches main late)
     a background thread's first task          calls bash `pwd`, then replies "Report: done"
     anything else                             "echo: <text>"
     json_schema requests (nap, handoff)       a valid object for the schema
@@ -54,6 +55,8 @@ def respond(body):
 
     rf = body.get("response_format")
     if rf:
+        if not is_main and "late report" in "\n".join(text_of(x.get("content")) for x in msgs):
+            time.sleep(4)
         props = rf.get("json_schema", {}).get("schema", {}).get("properties") or {"state": 0, "summary": 0, "facts": 0}
         full = {"state": f"{thread} state", "outcome": "success", "task_type": "probe", "summary": f"{thread} summary", "facts": []}
         return reply(json.dumps({k: v for k, v in full.items() if k in props}))

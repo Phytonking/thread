@@ -249,6 +249,11 @@ def _(w):
     code = w.wait_exit(90)
     assert code == 0, f"exit code {code}"
 
+@step(r'I run "(.*)" with a (\d+) second limit')
+def _(w, cmd, secs):
+    try: w.run(cmd, timeout=float(secs))
+    except subprocess.TimeoutExpired: raise AssertionError(f"command did not finish within {secs}s")
+
 @step(r'I run "(.*)"')
 def _(w, cmd): w.run(cmd)
 
@@ -323,6 +328,11 @@ def _(w, thread, text):
         if any(text in r[0] for r in rows): return
         time.sleep(0.2)
     raise AssertionError(f"notices for {thread}: {rows}")
+
+@step(r'thread "([^"]+)" has no live run')
+def _(w, name):
+    live = w.db().execute("SELECT id FROM runs WHERE thread_id = ? AND ended_at IS NULL", (name,)).fetchall()
+    assert not live, f"live runs left on {name}: {[r[0] for r in live]}"
 
 @step(r'thread "([^"]+)" exists')
 def _(w, thread):
