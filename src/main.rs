@@ -4,6 +4,7 @@ mod consolidate;
 mod db;
 mod input;
 mod llm;
+mod markdown;
 mod mcp;
 mod memory;
 mod picker;
@@ -975,7 +976,11 @@ fn switch(conn: &Connection, rt: &Arc<Runtime>, to: &str) -> Result<()> {
         eprintln!("\x1b[2mstate: {}\x1b[0m", llm::truncate(&t.state, 400));
     }
     if let Some(last) = threads::recent_output(conn, to, 1)?.pop() {
-        eprintln!("\x1b[2mlast:\x1b[0m {}", llm::truncate(&last, 1200));
+        let last = llm::truncate(&last, 1200);
+        match markdown::for_fd(libc::STDERR_FILENO) {
+            Some(st) => eprintln!("\x1b[2mlast:\x1b[0m\n{}", markdown::render(&last, st)),
+            None => eprintln!("\x1b[2mlast:\x1b[0m {last}"),
+        }
     }
     if let Some(what) = rt.pending_approval(conn, to) {
         eprintln!(
@@ -1074,13 +1079,14 @@ fn show(conn: &Connection, id: &str) -> Result<()> {
     println!(
         "\nwhere things stand:\n{}\n",
         if t.state.is_empty() {
-            "(nothing yet)"
+            "(nothing yet)".to_string()
         } else {
-            &t.state
+            markdown::for_stdout(&t.state)
         }
     );
     if let Some(last) = threads::recent_output(conn, id, 1)?.pop() {
-        println!("latest output:\n{}\n", llm::truncate(&last, 2000));
+        let last = llm::truncate(&last, 2000);
+        println!("latest output:\n{}\n", markdown::for_stdout(&last));
     }
     let mut stmt = conn.prepare("SELECT id, started_at, status, COALESCE(outcome,''), COALESCE(task_type,''), COALESCE(summary,''), surprise FROM runs WHERE thread_id = ?1 ORDER BY started_at DESC LIMIT 10")?;
     let rows = stmt.query_map([id], |r| {

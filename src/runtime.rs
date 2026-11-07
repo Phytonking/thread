@@ -167,7 +167,7 @@ impl Runtime {
         }
         if self.focus() == thread {
             match e {
-                Echo::Text(t) => println!("{t}"),
+                Echo::Text(t) => println!("{}", crate::markdown::for_stdout(t)),
                 Echo::Thinking(t) => eprintln!(
                     "{}",
                     render_thinking(t, self.thinking_expanded.load(Ordering::Relaxed))
