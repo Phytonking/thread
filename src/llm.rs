@@ -183,6 +183,13 @@ impl OpenAiCompat {
     }
 }
 
+/// A Chat Completions response that calls tools and says nothing.
+fn wants_tools(v: &Value) -> bool {
+    let msg = &v["choices"][0]["message"];
+    msg["tool_calls"].as_array().is_some_and(|c| !c.is_empty())
+        && msg["content"].as_str().is_none_or(|t| t.trim().is_empty())
+}
+
 fn is_context_overflow(low: &str) -> bool {
     [
         "context size",
@@ -218,7 +225,17 @@ impl Llm for OpenAiCompat {
             req["reasoning_effort"] = json!(e);
         }
         let structured = req.get("response_format").is_some();
+        // Side requests (naps, handoffs, memory) only want JSON. Small local models given the
+        // tool list call a tool instead (fm does), and the list eats a small window, so drop it.
+        if structured && self.provider.is_local_model() {
+            req.as_object_mut().map(|o| o.remove("tools"));
+        }
         let (mut status, mut v) = self.exchange(&req)?;
+        // Any model can still answer a structured request with tool calls; ask again without tools.
+        if status == 200 && structured && req.get("tools").is_some() && wants_tools(&v) {
+            req.as_object_mut().map(|o| o.remove("tools"));
+            (status, v) = self.exchange(&req)?;
+        }
         // Side requests (naps, handoffs, memory) only want JSON; a model without tool calling
         // can still write that, so drop the tool list rather than fail.
         if status != 200
@@ -712,6 +729,16 @@ mod tests {
             "ids are made up when missing"
         );
         assert_eq!(context_tokens(&r), 900);
+    }
+
+    #[test]
+    fn detects_tool_calls_instead_of_an_answer() {
+        let call = json!([{"id": "a", "type": "function", "function": {"name": "checkpoint", "arguments": "{}"}}]);
+        let r = |content: Value, calls: Value| json!({"choices": [{"message": {"content": content, "tool_calls": calls}}]});
+        assert!(wants_tools(&r(Value::Null, call.clone())));
+        assert!(wants_tools(&r(json!(" "), call.clone())));
+        assert!(!wants_tools(&r(json!("{\"state\": \"x\"}"), call)));
+        assert!(!wants_tools(&r(json!("{}"), json!([]))));
     }
 
     #[test]
