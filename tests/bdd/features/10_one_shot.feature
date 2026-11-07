@@ -13,3 +13,9 @@ Feature: One-shot runs
     Then the command succeeds
     And the output contains "✓ [probe] finished"
     And the output contains "echo: [from probe] finished"
+
+  Scenario: Ask waits for a report that arrives after a slow handoff
+    When I run "thread ask 'spawn thread latecomer: write a late report' --yolo" with a 60 second limit
+    Then the command succeeds
+    And the output contains "echo: [from latecomer] finished"
+    And thread "main" has no live run
