@@ -52,7 +52,7 @@ You can do work yourself with bash and the editor, and you can run work in backg
 When to spawn a background thread (`spawn_thread`): self-contained work that takes more than a few steps and does not need the user turn by turn: implementing a feature, chasing a bug, running and fixing a test suite, an investigation or review. \
 Give it a short kebab-case name the user can recognize and type (e.g. fix-login-redirect), and a complete task description with everything it needs, since it cannot see this conversation. \
 Use `worktree: true` when it will edit code, so it works on its own branch (thread/<name>) without colliding with other threads. \
-Each thread can run on its own provider (claude, codex, grok, api) and model: honour what the user asks for (\"have codex do it\", \"use opus for the review\"), otherwise use `default` for both. `set_thread_model` moves an existing thread. \
+Each thread can run on its own provider (claude, codex, grok, api, or a local model: ollama, fm, local) and model: honour what the user asks for (\"have codex do it\", \"use opus for the review\"), otherwise use `default` for both. `set_thread_model` moves an existing thread. \
 Do small things (a quick question, a one-line fix, reading a file) yourself. \
 Background threads exist only through `spawn_thread`: never substitute another subagent, task or parallel-agent tool for it. If `spawn_thread` fails, tell the user the exact error instead of working around it.
 
@@ -196,8 +196,28 @@ impl<'a> Agent<'a> {
         self
     }
 
+    /// A local model in the built-in loop: its default model, and naps early enough that
+    /// the distillation itself still fits a small context window.
+    pub fn with_local(mut self, provider: Provider, model: Option<String>) -> Self {
+        self.provider = provider;
+        self.model = model;
+        if let Some(window) = provider.context_window() {
+            self.nap_threshold = self.nap_threshold.min(window * 6 / 10);
+        }
+        self
+    }
+
     fn is_cli(&self) -> bool {
-        self.provider != Provider::Api
+        !self.provider.in_process()
+    }
+
+    /// Every request (turns, naps, handoffs) runs on the thread's model: a side request on
+    /// another model would make a local server load a second one.
+    fn with_model(&self, mut body: Value) -> Value {
+        if let Some(m) = self.current_model() {
+            body["model"] = json!(m);
+        }
+        body
     }
 
     /// The thread's /model override (re-read each turn so changes apply live), else the default.
@@ -394,11 +414,9 @@ impl<'a> Agent<'a> {
             if self.cancel.load(Ordering::Relaxed) {
                 return Ok(Step::Stopped);
             }
-            let mut body =
-                json!({"system": self.system(), "tools": defs, "messages": self.messages});
-            if let Some(m) = self.current_model() {
-                body["model"] = json!(m);
-            }
+            let body = self.with_model(
+                json!({"system": self.system(), "tools": defs, "messages": self.messages}),
+            );
             let resp = self.llm.send(body)?;
             let ctx_tokens = llm::context_tokens(&resp);
             let blocks = resp["content"].clone();
@@ -522,8 +540,8 @@ impl<'a> Agent<'a> {
             }
             _ => msgs.push(json!({"role": "user", "content": [ask]})),
         }
-        let resp = self.llm.send(json!({"system": self.system(), "tools": tools::definitions(self.is_main()), "messages": msgs,
-            "output_config": {"format": {"type": "json_schema", "schema": nap_schema()}}}))?;
+        let resp = self.llm.send(self.with_model(json!({"system": self.system(), "tools": tools::definitions(self.is_main()), "messages": msgs,
+            "output_config": {"format": {"type": "json_schema", "schema": nap_schema()}}})))?;
         let v = llm::parse_structured(&resp)?;
         let run = self.ensure_run()?;
         consolidate::learn_all(self.conn, Some(&run), &self.thread.id, &v["facts"])?;
@@ -583,10 +601,10 @@ impl<'a> Agent<'a> {
             _ => msgs.push(json!({"role": "user", "content": format!("{}{ask}", self.prefix)})),
         }
         // A side request: the handoff exchange is not appended to the thread's conversation.
-        let resp = self.llm.send(
+        let resp = self.llm.send(self.with_model(
             json!({"system": self.system(), "tools": tools::definitions(main), "messages": msgs,
             "output_config": {"format": {"type": "json_schema", "schema": handoff_schema(main)}}}),
-        )?;
+        ))?;
         let v = llm::parse_structured(&resp)?;
         self.finish_handoff(&run, v)
     }
@@ -823,7 +841,8 @@ mod tests {
                 json!({"state": "migration + backfill written", "outcome": "success", "task_type": "db-migration", "summary": "Wrote billing migration.", "facts": [{"entity": "billing", "attribute": "owner", "value": "payments team"}]}),
             ),
         ]);
-        let mut a = agent(&c, &llm, "billing-pg");
+        let mut a =
+            agent(&c, &llm, "billing-pg").with_local(Provider::Ollama, Some("qwen3:8b".into()));
         // steering message lands while the first tool call runs
         threads::send(&c, "billing-pg", "user", "also add a backfill").unwrap();
         let Step::Idle(text) = a.step().unwrap() else {
@@ -868,6 +887,11 @@ mod tests {
         );
         assert_eq!(memory::list_facts(&c, false).unwrap().len(), 2);
         assert_eq!(consolidate::pending(&c).unwrap(), 1);
+        // turns, the nap and the handoff all run on the thread's model (one model loaded locally)
+        let reqs = llm.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 5);
+        assert!(reqs.iter().all(|r| r["model"] == "qwen3:8b"), "{reqs:?}");
+        drop(reqs);
         // the conversation itself survives for follow-ups
         let (msgs, _) = threads::load_messages(&c, "billing-pg").unwrap();
         assert!(!msgs.is_empty());

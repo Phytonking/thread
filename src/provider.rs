@@ -1,26 +1,38 @@
 //! Providers. Subscription logins are used by driving each vendor's official CLI
 //! headlessly (Claude Code, Codex, Grok Build), so auth stays in those tools.
 //! `api` is the fallback: any OpenAI-compatible endpoint with a key.
+//! `ollama`, `fm` (Apple Foundation Models) and `local` (LM Studio, llama.cpp, vLLM…)
+//! run on this machine through the same in-process agent loop as `api`, no key needed.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Provider {
     Claude,
     Codex,
     Grok,
     Api,
+    Ollama,
+    Fm,
+    Local,
 }
 
-pub const ALL: [Provider; 4] = [
+pub const ALL: [Provider; 7] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Grok,
     Provider::Api,
+    Provider::Ollama,
+    Provider::Fm,
+    Provider::Local,
 ];
+
+/// Names accepted wherever a provider is chosen (tool enums, help text).
+pub const NAMES: &str = "claude, codex, grok, api, ollama, fm, local";
 
 impl Provider {
     pub fn parse(s: &str) -> Result<Self> {
@@ -29,7 +41,11 @@ impl Provider {
             "codex" | "openai" | "chatgpt" => Provider::Codex,
             "grok" | "xai" => Provider::Grok,
             "api" | "key" | "anthropic-api" => Provider::Api,
-            other => bail!("unknown provider '{other}' (claude, codex, grok, api)"),
+            "ollama" => Provider::Ollama,
+            "fm" | "apple" | "afm" | "foundation-models" => Provider::Fm,
+            "local" | "lmstudio" | "lm-studio" | "llama.cpp" | "llamacpp" | "llama-server"
+            | "vllm" | "openai-compat" => Provider::Local,
+            other => bail!("unknown provider '{other}' ({NAMES})"),
         })
     }
 
@@ -39,22 +55,55 @@ impl Provider {
             Provider::Codex => "codex",
             Provider::Grok => "grok",
             Provider::Api => "api",
+            Provider::Ollama => "ollama",
+            Provider::Fm => "fm",
+            Provider::Local => "local",
         }
     }
 
+    /// The vendor CLI a provider drives; `None` for the in-process ones.
     pub fn binary(self) -> Option<&'static str> {
         match self {
             Provider::Claude => Some("claude"),
             Provider::Codex => Some("codex"),
             Provider::Grok => Some("grok"),
-            Provider::Api => None,
+            _ => None,
         }
     }
 
+    /// Runs the harness's own agent loop over an OpenAI-compatible (or Ollama) endpoint.
+    pub fn in_process(self) -> bool {
+        self.binary().is_none()
+    }
+
+    /// A model served on this machine (or the user's own server): no key, no usage billing.
+    pub fn is_local_model(self) -> bool {
+        matches!(self, Provider::Ollama | Provider::Fm | Provider::Local)
+    }
+
     pub fn installed(self) -> bool {
-        match self.binary() {
-            Some(b) => which(b).is_some(),
-            None => true,
+        match self {
+            Provider::Fm => which("fm").is_some(),
+            _ => match self.binary() {
+                Some(b) => which(b).is_some(),
+                None => true,
+            },
+        }
+    }
+
+    /// Context window to plan around, in tokens, when it is small enough to matter.
+    /// `THREAD_CONTEXT_WINDOW` overrides it (used for the local providers).
+    pub fn context_window(self) -> Option<u64> {
+        if let Some(n) = std::env::var("THREAD_CONTEXT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            return Some(n);
+        }
+        match self {
+            Provider::Fm => Some(FM_CONTEXT),
+            Provider::Ollama => Some(ollama_num_ctx()),
+            _ => None,
         }
     }
 
@@ -140,6 +189,41 @@ impl Provider {
                     ),
                 }
             }
+            Provider::Ollama => ollama_status(),
+            Provider::Fm => fm_status(),
+            Provider::Local => match local_base() {
+                None => (
+                    false,
+                    format!(
+                        "no server found ({}) — start one, or set THREAD_LOCAL_URL / thread login local",
+                        LOCAL_SERVERS
+                            .iter()
+                            .map(|(n, u)| format!("{n} {}", u.trim_end_matches("/v1")))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ),
+                Some(base) if reachable(&format!("{base}/models")) => {
+                    (true, format!("OpenAI-compatible server at {base}"))
+                }
+                Some(base) => (false, format!("{base} is not reachable")),
+            },
+        }
+    }
+
+    /// (base URL, key) for in-process providers. Ollama's is the server root (native API).
+    pub fn endpoint(self) -> Option<(String, Option<String>)> {
+        match self {
+            Provider::Api => Some(api_config()),
+            Provider::Ollama => Some((ollama_host(), None)),
+            Provider::Fm => Some((fm_base(), None)),
+            Provider::Local => local_base().map(|b| {
+                let key = std::env::var("THREAD_LOCAL_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty());
+                (b, key)
+            }),
+            _ => None,
         }
     }
 
@@ -150,6 +234,24 @@ impl Provider {
             Provider::Codex => ("codex", &["login"]),
             Provider::Grok => ("grok", &["login"]),
             Provider::Api => return login_api_key(),
+            Provider::Ollama => {
+                if which("ollama").is_none() && !reachable(&format!("{}/api/tags", ollama_host())) {
+                    bail!("Ollama is not installed: https://ollama.com/download");
+                }
+                eprintln!(
+                    "Ollama needs no login. Start it (`ollama serve` or the app), pull a model with tool calling (e.g. `ollama pull qwen3`), then `thread use ollama`."
+                );
+                return Ok(());
+            }
+            Provider::Fm => {
+                if !self.installed() {
+                    bail!("{}", fm_status().1);
+                }
+                // Apple's terms must be accepted once, interactively.
+                Command::new("fm").arg("license").status().ok();
+                return Ok(());
+            }
+            Provider::Local => return login_local(),
         };
         if !self.installed() {
             bail!("{bin} is not installed: {}", self.status().1);
@@ -241,6 +343,361 @@ pub fn api_default_model() -> Option<String> {
                 .map(String::from)
         })
         .or_else(|| models(Provider::Api, false).0.first().map(|m| m.id.clone()))
+}
+
+// ---- local model servers: ollama, fm, local ----
+
+/// Apple's on-device model has a small window (measured ~8k tokens on AFM 3).
+const FM_CONTEXT: u64 = 8192;
+const FM_DEFAULT_URL: &str = "http://127.0.0.1:1976/v1";
+/// Ollama's own default context is 4096 tokens and it truncates silently, which cuts off
+/// the system prompt and tools. We ask for this much instead (`THREAD_OLLAMA_NUM_CTX`).
+const OLLAMA_NUM_CTX: u64 = 32768;
+/// Well-known OpenAI-compatible servers, probed in order when `local` has no URL set.
+pub const LOCAL_SERVERS: [(&str, &str); 3] = [
+    ("LM Studio", "http://127.0.0.1:1234/v1"),
+    ("llama.cpp", "http://127.0.0.1:8080/v1"),
+    ("vLLM", "http://127.0.0.1:8000/v1"),
+];
+
+fn env_nonempty(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn get_json(url: &str, timeout_ms: u64) -> Option<Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
+        .build()
+        .into();
+    let mut resp = agent.get(url).call().ok()?;
+    resp.body_mut().read_json().ok()
+}
+
+/// Something answers `GET url` with JSON, quickly.
+pub fn reachable(url: &str) -> bool {
+    get_json(url, 1500).is_some()
+}
+
+/// `OLLAMA_HOST` as Ollama itself reads it (`host`, `host:port` or a URL), as a base URL.
+pub fn ollama_host() -> String {
+    normalize_host(
+        &env_nonempty("OLLAMA_HOST").unwrap_or_else(|| "127.0.0.1".into()),
+        11434,
+    )
+}
+
+fn normalize_host(raw: &str, default_port: u16) -> String {
+    let raw = raw.trim().trim_end_matches('/');
+    let (scheme, rest) = raw.split_once("://").unwrap_or(("http", raw));
+    // the bind-all address is how servers listen, not where clients connect
+    let rest = rest.replace("0.0.0.0", "127.0.0.1");
+    let has_port = rest
+        .rsplit_once(':')
+        .is_some_and(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    if has_port || scheme == "https" {
+        format!("{scheme}://{rest}")
+    } else {
+        format!("{scheme}://{rest}:{default_port}")
+    }
+}
+
+pub fn ollama_num_ctx() -> u64 {
+    env_nonempty("THREAD_OLLAMA_NUM_CTX")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(OLLAMA_NUM_CTX)
+}
+
+fn ollama_status() -> (bool, String) {
+    let host = ollama_host();
+    match get_json(&format!("{host}/api/tags"), 2000) {
+        Some(v) => {
+            let ms = v["models"].as_array().cloned().unwrap_or_default();
+            let tools = ms.iter().filter(|m| ollama_has_tools(m)).count();
+            if ms.is_empty() {
+                (
+                    false,
+                    format!("running at {host}, but no models — ollama pull qwen3"),
+                )
+            } else {
+                (
+                    true,
+                    format!(
+                        "running at {host}: {} models, {tools} with tool calling",
+                        ms.len()
+                    ),
+                )
+            }
+        }
+        None if which("ollama").is_some() => (
+            false,
+            format!("installed but not running at {host} — ollama serve (or open the app)"),
+        ),
+        None => (false, "not installed — https://ollama.com/download".into()),
+    }
+}
+
+/// Older Ollama versions don't report capabilities; then let the server decide.
+fn ollama_has_tools(m: &Value) -> bool {
+    m["capabilities"]
+        .as_array()
+        .is_none_or(|c| c.iter().any(|x| x == "tools"))
+}
+
+/// `GET /api/tags`: installed models, most recently pulled first, noting tool support.
+fn ollama_live() -> Vec<ModelOpt> {
+    let Some(v) = get_json(&format!("{}/api/tags", ollama_host()), 3000) else {
+        return vec![];
+    };
+    let mut ms: Vec<&Value> = v["models"].as_array().into_iter().flatten().collect();
+    ms.sort_by(|a, b| b["modified_at"].as_str().cmp(&a["modified_at"].as_str()));
+    ms.into_iter()
+        .filter_map(|m| {
+            let id = m["name"].as_str().or(m["model"].as_str())?;
+            let mut note = vec![];
+            if let Some(s) = m["details"]["parameter_size"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                note.push(s.to_string());
+            }
+            if m["remote_model"].is_string() {
+                note.push("cloud".into());
+            }
+            note.push(if ollama_has_tools(m) {
+                "tools".into()
+            } else {
+                "no tool calling".into()
+            });
+            Some(opt(id, &note.join(" · ")))
+        })
+        .collect()
+}
+
+pub fn fm_base() -> String {
+    env_nonempty("THREAD_FM_URL")
+        .or_else(|| {
+            read_json("config.json")["fm_url"]
+                .as_str()
+                .map(String::from)
+        })
+        .unwrap_or_else(|| FM_DEFAULT_URL.into())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' && it.peek() == Some(&'[') {
+            for d in it.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn fm_output(args: &[&str]) -> Option<String> {
+    let o = Command::new("fm")
+        .args(args)
+        .env("NO_COLOR", "1")
+        .output()
+        .ok()?;
+    Some(strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )))
+}
+
+fn fm_status() -> (bool, String) {
+    let base = fm_base();
+    if reachable(&format!("{base}/models")) {
+        return (true, format!("Apple Foundation Models server at {base}"));
+    }
+    if which("fm").is_none() {
+        return (
+            false,
+            "not available — needs the `fm` CLI (macOS with Apple Intelligence), or an OpenAI-compatible bridge at THREAD_FM_URL".into(),
+        );
+    }
+    let license = fm_output(&["license", "--status"]).unwrap_or_default();
+    if !license.to_lowercase().contains("agreed to") {
+        return (
+            false,
+            "accept Apple's terms once — thread login fm (runs `fm license`)".into(),
+        );
+    }
+    let models = fm_output(&["models"]).unwrap_or_default();
+    if !models
+        .lines()
+        .any(|l| l.trim_start().starts_with("✓ system"))
+    {
+        let why = models
+            .lines()
+            .find(|l| l.contains("system"))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| "`fm models` lists no on-device model".into());
+        return (
+            false,
+            format!("on-device model unavailable (is Apple Intelligence on?): {why}"),
+        );
+    }
+    (
+        true,
+        format!(
+            "on-device Apple Foundation Model, ~{}k context (thread starts `fm serve` at {base} on demand)",
+            FM_CONTEXT / 1024
+        ),
+    )
+}
+
+fn port_of(url: &str) -> Option<u16> {
+    let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = after.split('/').next()?;
+    host.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Start `fm serve` if nothing answers at the fm URL. It lives as long as this process: a
+/// shell holds our stdin pipe and stops the server when the pipe closes (when we exit).
+/// It runs in its own process group, so Ctrl-C in the REPL doesn't take it down.
+pub fn ensure_fm_server() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::Mutex;
+    static SERVER: Mutex<Option<std::process::Child>> = Mutex::new(None);
+    let base = fm_base();
+    let mut guard = SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    if reachable(&format!("{base}/models")) {
+        return Ok(());
+    }
+    if !is_local(&base) {
+        bail!("fm: nothing answers at {base}");
+    }
+    if which("fm").is_none() {
+        bail!("fm: {}", fm_status().1);
+    }
+    if let Some(mut old) = guard.take() {
+        old.kill().ok();
+        old.wait().ok();
+    }
+    let port = port_of(&base).unwrap_or(1976).to_string();
+    let child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"fm serve --port "$1" >/dev/null 2>&1 & pid=$!; read _; kill $pid"#,
+            "sh",
+            &port,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("starting fm serve")?;
+    *guard = Some(child);
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(200));
+        if reachable(&format!("{base}/models")) {
+            return Ok(());
+        }
+    }
+    bail!("fm serve did not come up at {base}: {}", fm_status().1)
+}
+
+/// The `local` server: THREAD_LOCAL_URL, else `thread login local`'s choice, else the first
+/// well-known port that answers (checked once per process).
+pub fn local_base() -> Option<String> {
+    if let Some(u) = env_nonempty("THREAD_LOCAL_URL").or_else(|| {
+        read_json("config.json")["local_url"]
+            .as_str()
+            .map(String::from)
+    }) {
+        return Some(u.trim_end_matches('/').to_string());
+    }
+    static FOUND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            LOCAL_SERVERS
+                .iter()
+                .map(|(_, u)| u.to_string())
+                .find(|u| reachable(&format!("{u}/models")))
+        })
+        .clone()
+}
+
+fn login_local() -> Result<()> {
+    let cur = local_base().unwrap_or_else(|| LOCAL_SERVERS[0].1.into());
+    eprintln!(
+        "Any OpenAI-compatible server: LM Studio http://127.0.0.1:1234/v1, llama.cpp (llama-server) http://127.0.0.1:8080/v1, vLLM http://127.0.0.1:8000/v1."
+    );
+    let base = prompt_line(&format!("Base URL [{cur}]: "))?;
+    let base = if base.is_empty() {
+        cur
+    } else {
+        base.trim_end_matches('/').to_string()
+    };
+    let mut cfg = read_json("config.json");
+    cfg["local_url"] = json!(base);
+    if let Some(m) = cfg.as_object_mut() {
+        m.remove("local_model");
+    }
+    write_json("config.json", &cfg, false)?;
+    let list = openai_models(&base, None, 10_000);
+    if list.is_empty() {
+        bail!("saved, but {base}/models returned nothing; is the server running?");
+    }
+    for (i, m) in list.iter().take(20).enumerate() {
+        eprintln!("  {:>2}. {}", i + 1, m.id);
+    }
+    let pick = prompt_line("Default model [1]: ")?;
+    let id = resolve_in(
+        Provider::Local,
+        &list,
+        true,
+        if pick.is_empty() { "1" } else { &pick },
+    )?;
+    let mut cfg = read_json("config.json");
+    cfg["local_model"] = json!(id);
+    write_json("config.json", &cfg, false)?;
+    eprintln!("default local model: {id}");
+    Ok(())
+}
+
+/// The model an in-process thread uses when neither it nor --model names one.
+pub fn default_model(p: Provider) -> Option<String> {
+    match p {
+        Provider::Api => api_default_model(),
+        Provider::Ollama => env_nonempty("THREAD_OLLAMA_MODEL")
+            .or_else(|| {
+                read_json("config.json")["ollama_model"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .or_else(|| {
+                let list = models(p, false).0;
+                // prefer a model on this machine that can call tools
+                let pick = list
+                    .iter()
+                    .find(|m| m.note.ends_with("tools") && !m.note.contains("cloud"))
+                    .or_else(|| list.iter().find(|m| m.note.ends_with("tools")))
+                    .or(list.first());
+                pick.map(|m| m.id.clone())
+            }),
+        Provider::Fm => env_nonempty("THREAD_FM_MODEL").or_else(|| Some("system".into())),
+        Provider::Local => env_nonempty("THREAD_LOCAL_MODEL")
+            .or_else(|| {
+                read_json("config.json")["local_model"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .or_else(|| models(p, false).0.first().map(|m| m.id.clone())),
+        _ => None,
+    }
 }
 
 fn prompt_line(label: &str) -> Result<String> {
@@ -370,8 +827,12 @@ pub fn resolve_default(flag: Option<&str>) -> Result<Provider> {
     if Provider::Api.status().0 {
         return Ok(Provider::Api);
     }
+    // nothing in the cloud: a running Ollama with models will do
+    if Provider::Ollama.status().0 {
+        return Ok(Provider::Ollama);
+    }
     bail!(
-        "no provider is logged in. Run `thread login claude` (or codex, grok), or `thread login api` for an API key"
+        "no provider is logged in. Run `thread login claude` (or codex, grok), `thread login api` for an API key, or `thread use ollama|fm|local` for a local model"
     )
 }
 
@@ -488,6 +949,23 @@ pub fn models(p: Provider, refresh: bool) -> (Vec<ModelOpt>, bool, i64) {
         Provider::Codex => codex_live(),
         Provider::Grok => grok_live(),
         Provider::Api => api_live(),
+        Provider::Ollama => ollama_live(),
+        Provider::Fm => {
+            let live = openai_models(&fm_base(), None, 1500);
+            if live.is_empty() {
+                // the server starts on demand; these are what `fm serve` offers
+                vec![
+                    opt("system", "on-device Apple Foundation Model"),
+                    opt("pcc", "Apple Foundation Model on Private Cloud Compute"),
+                ]
+            } else {
+                live
+            }
+        }
+        Provider::Local => match local_base() {
+            Some(b) => openai_models(&b, env_nonempty("THREAD_LOCAL_API_KEY"), 5000),
+            None => vec![],
+        },
     };
     if !live.is_empty() {
         let mut cache = cache.clone();
@@ -632,8 +1110,12 @@ fn api_live() -> Vec<ModelOpt> {
     if key.is_none() && !is_local(&base) {
         return vec![];
     }
+    openai_models(&base, key, 10_000)
+}
+
+fn openai_models(base: &str, key: Option<String>, timeout_ms: u64) -> Vec<ModelOpt> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .timeout_global(Some(Duration::from_millis(timeout_ms)))
         .build()
         .into();
     let mut req = agent.get(&format!("{base}/models"));
@@ -791,5 +1273,67 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert_ne!(u, uuid());
+    }
+
+    #[test]
+    fn local_providers() {
+        assert_eq!(Provider::parse("Ollama").unwrap(), Provider::Ollama);
+        assert_eq!(Provider::parse("apple").unwrap(), Provider::Fm);
+        for n in ["lmstudio", "llama.cpp", "vllm", "openai-compat"] {
+            assert_eq!(Provider::parse(n).unwrap(), Provider::Local, "{n}");
+        }
+        assert!(
+            Provider::parse("gemini")
+                .unwrap_err()
+                .to_string()
+                .contains("ollama, fm, local")
+        );
+        for p in ALL {
+            assert_eq!(Provider::parse(p.name()).unwrap(), p);
+            assert_eq!(p.in_process(), p.binary().is_none());
+        }
+        assert!(Provider::Ollama.is_local_model() && !Provider::Api.is_local_model());
+        assert!(Provider::Api.in_process() && !Provider::Claude.in_process());
+    }
+
+    #[test]
+    fn hosts_and_urls() {
+        assert_eq!(normalize_host("127.0.0.1", 11434), "http://127.0.0.1:11434");
+        assert_eq!(
+            normalize_host("0.0.0.0:9000", 11434),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(
+            normalize_host("http://box.lan/", 11434),
+            "http://box.lan:11434"
+        );
+        assert_eq!(
+            normalize_host("https://ollama.example.com", 11434),
+            "https://ollama.example.com"
+        );
+        assert_eq!(port_of("http://127.0.0.1:1976/v1"), Some(1976));
+        assert_eq!(port_of("http://localhost/v1"), None);
+        assert_eq!(strip_ansi("\x1b[32m✓ system\x1b[0m ok"), "✓ system ok");
+    }
+
+    #[test]
+    fn ollama_tool_capability() {
+        assert!(ollama_has_tools(
+            &json!({"capabilities": ["completion", "tools"]})
+        ));
+        assert!(!ollama_has_tools(&json!({"capabilities": ["completion"]})));
+        assert!(
+            ollama_has_tools(&json!({"name": "old-server"})),
+            "unknown: let the server decide"
+        );
+        let ollama = vec![
+            opt("qwen3:8b", "8.2B · tools"),
+            opt("gemma3:4b", "4B · no tool calling"),
+        ];
+        assert_eq!(
+            resolve_in(Provider::Ollama, &ollama, false, "qwen3").unwrap(),
+            "qwen3:8b"
+        );
+        assert!(resolve_in(Provider::Ollama, &ollama, false, "llama4").is_err());
     }
 }

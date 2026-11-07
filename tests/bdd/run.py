@@ -95,8 +95,12 @@ class World:
         self.last = None
         self.env = dict(os.environ)
         self.env["XDG_CONFIG_HOME"] = str(self.cfg)
-        for k in ("OPENAI_API_KEY", "THREAD_PROVIDER", "THREAD_MODEL", "OPENAI_BASE_URL", "NO_COLOR"):
+        for k in ("OPENAI_API_KEY", "THREAD_PROVIDER", "THREAD_MODEL", "OPENAI_BASE_URL", "NO_COLOR",
+                  "OLLAMA_HOST", "THREAD_OLLAMA_MODEL", "THREAD_LOCAL_URL", "THREAD_LOCAL_MODEL", "THREAD_FM_URL",
+                  "THREAD_FM_MODEL", "THREAD_CONTEXT_WINDOW", "THREAD_MEMORY_PROVIDER", "THREAD_MEMORY_MODEL"):
             self.env.pop(k, None)
+        # never probe a real Ollama on this machine: point it at a closed port unless a scenario serves one
+        self.env["OLLAMA_HOST"] = "127.0.0.1:9"
 
     # -- mock model server
     def start_mock(self, models=None):
@@ -111,6 +115,14 @@ class World:
             except OSError: time.sleep(0.05)
         self.env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
         self.env["THREAD_PROVIDER"] = "api"
+
+    def serve_as(self, provider):
+        """Point a local-model provider at the mock instead of the api provider."""
+        base = self.env.pop("OPENAI_BASE_URL")
+        self.env["THREAD_PROVIDER"] = provider
+        if provider == "ollama": self.env["OLLAMA_HOST"] = base.removesuffix("/v1")
+        elif provider == "fm": self.env["THREAD_FM_URL"] = base
+        else: self.env["THREAD_LOCAL_URL"] = base
 
     def requests(self):
         if not self.log.exists(): return []
@@ -207,6 +219,11 @@ def _(w): w.start_mock()
 @step(r'the model server offers models "([^"]+)"')
 def _(w, models): w.start_mock(",".join(m.strip() for m in models.split(",")))
 
+@step(r'the model server is running as (ollama|fm|local)(?: with models "([^"]+)")?')
+def _(w, provider, models):
+    w.start_mock(",".join(m.strip() for m in models.split(",")) if models else None)
+    w.serve_as(provider)
+
 @step(r'the provider "([^"]+)" is not installed')
 def _(w, name):
     w.env["PATH"] = os.pathsep.join(d for d in w.env["PATH"].split(os.pathsep) if not (Path(d) / name).exists())
@@ -298,6 +315,11 @@ def _(w, text):
 def _(w, model):
     mains = [r for r in w.requests() if r["thread"] == "main"]
     assert mains and mains[-1]["model"] == model, f"last model was {mains[-1]['model'] if mains else None}"
+
+@step(r'every request to the model used model "([^"]+)"')
+def _(w, model):
+    used = {r["model"] for r in w.requests()}
+    assert used == {model}, f"models used: {used}"
 
 @step(r'a request from thread "([^"]+)" used model "([^"]+)"')
 def _(w, thread, model):

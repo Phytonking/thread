@@ -36,7 +36,7 @@ struct Cli {
     /// Run tools without asking, in every thread
     #[arg(long, global = true)]
     yolo: bool,
-    /// Provider for threads that don't name one: claude | codex | grok | api (default: `thread use`, else first logged in)
+    /// Provider for threads that don't name one: claude | codex | grok | api | ollama | fm | local (default: `thread use`, else first logged in)
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Model for the default provider (/model picks per thread)
@@ -54,7 +54,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Log in: claude, codex or grok (your subscription, via its CLI), or api (a key). No argument: show status
+    /// Log in: claude, codex or grok (your subscription, via its CLI), api (a key), or set up a local model: ollama, fm, local. No argument: show status
     Login { provider: Option<String> },
     /// Show which providers are installed and logged in
     #[command(hide = true)]
@@ -217,7 +217,7 @@ fn real_main() -> Result<()> {
         Some(Cmd::Login { provider }) => {
             let Some(name) = provider else {
                 print_status();
-                println!("\nthread login <claude|codex|grok|api>");
+                println!("\nthread login <claude|codex|grok|api|ollama|fm|local>");
                 return Ok(());
             };
             let p = Provider::parse(name)?;
@@ -273,17 +273,25 @@ fn real_main() -> Result<()> {
             .map(|p| Provider::parse(&p))
             .transpose()?
             .unwrap_or(default);
-        let mem_model = memory_model.clone().or_else(|| {
-            (mem_provider == default)
-                .then(|| model_flag.clone())
-                .flatten()
-        });
-        let mem = runtime::memory_llm(mem_provider, api_llm(mem_model.clone(), None), mem_model)?;
+        // `--model qwen3` picks the installed qwen3:8b
+        let local_model = |p: Provider, m: Option<String>| match m {
+            Some(m) if p.is_local_model() => Some(provider::resolve_model(p, &m).unwrap_or(m)),
+            m => m,
+        };
         let cli_model = if default == Provider::Api {
             None
         } else {
-            model_flag.clone()
+            local_model(default, model_flag.clone())
         };
+        let mem_model = local_model(
+            mem_provider,
+            memory_model.clone().or_else(|| {
+                (mem_provider == default)
+                    .then(|| model_flag.clone())
+                    .flatten()
+            }),
+        );
+        let mem = runtime::memory_llm(mem_provider, api_llm(mem_model.clone(), None), mem_model)?;
         let rt = Runtime::with(
             db_path.clone(),
             root.clone(),
@@ -430,7 +438,7 @@ const HELP: &str = "\
 just type to talk to the focused thread
 y / n                  answer an approval
 /model [name]          show or set this thread's model (`default` to reset)
-/provider [name [model]] show providers, or move this thread (claude, codex, grok, api)
+/provider [name [model]] show providers, or move this thread (claude, codex, grok, api, ollama, fm, local)
 /mcp                   list MCP servers  ·  /mcp add <name> <command…|url>  ·  /mcp rm <name>
 /threads               list threads
 /y /n /always [name|all] answer approvals from any thread (`always`: never ask about that tool again)

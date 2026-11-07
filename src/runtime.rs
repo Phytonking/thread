@@ -55,6 +55,8 @@ pub struct Runtime {
     pub thinking_expanded: AtomicBool,
     /// Output of `!` commands, attached to the user's next message to that thread.
     pub shell_notes: Mutex<HashMap<String, String>>,
+    /// Clients for local-model providers (ollama, fm, local), built on first use.
+    pub local_llms: Mutex<HashMap<Provider, Arc<dyn Llm>>>,
     workers: Mutex<HashMap<String, Worker>>,
     focus: Mutex<String>,
 }
@@ -104,9 +106,30 @@ impl Runtime {
             cli_model,
             thinking_expanded: AtomicBool::new(crate::provider::thinking_expanded()),
             shell_notes: Mutex::new(HashMap::new()),
+            local_llms: Mutex::new(HashMap::new()),
             workers: Mutex::new(HashMap::new()),
             focus: Mutex::new(MAIN.to_string()),
         })
+    }
+
+    /// The client for an in-process provider: `llm` for `api`; local ones are built on first use.
+    pub fn llm_for(&self, p: Provider) -> Arc<dyn Llm> {
+        if p == Provider::Api || !p.in_process() {
+            return self.llm.clone();
+        }
+        let mut map = self.local_llms.lock().unwrap();
+        if let Some(l) = map.get(&p) {
+            return l.clone();
+        }
+        match llm::OpenAiCompat::for_provider(p, None, None) {
+            Ok(c) => {
+                let l: Arc<dyn Llm> = Arc::new(c);
+                map.insert(p, l.clone());
+                l
+            }
+            // not cached: the next turn tries again (say, once the server is up)
+            Err(e) => Arc::new(Unavailable(format!("{e:#}"))),
+        }
     }
 
     pub fn provider_of(&self, t: &threads::Thread) -> Provider {
@@ -483,9 +506,10 @@ fn worker_loop(
     let echo = Box::new(move |e: Echo| rt2.echo(&id2, e));
     let root = rt.root.display().to_string();
     let provider = rt.provider_of(&t);
+    let llm = rt.llm_for(provider);
     let mut agent = Agent::load(
         &conn,
-        rt.llm.as_ref(),
+        llm.as_ref(),
         id,
         &root,
         approval,
@@ -493,14 +517,16 @@ fn worker_loop(
         cancel.clone(),
         echo,
     )?;
-    if provider != Provider::Api {
-        // --model was given for the default provider; other providers use their own default.
-        let model = if provider == rt.default_provider {
-            rt.cli_model.clone()
-        } else {
-            None
-        };
+    // --model was given for the default provider; other providers use their own default.
+    let model = if provider == rt.default_provider {
+        rt.cli_model.clone()
+    } else {
+        None
+    };
+    if !provider.in_process() {
         agent = agent.with_cli(provider, model, rt.mcp_spec(id));
+    } else if provider != Provider::Api {
+        agent = agent.with_local(provider, model);
     }
     let mut failed = false;
     loop {
@@ -788,8 +814,22 @@ pub fn memory_llm(
         Provider::Api => {
             api.ok_or_else(|| anyhow::anyhow!("the api provider isn't set up (thread login api)"))?
         }
+        p if p.in_process() => match llm::OpenAiCompat::for_provider(p, model, None) {
+            Ok(c) => Arc::new(c),
+            // memory work is occasional; report the problem then rather than refuse to start
+            Err(e) => Arc::new(Unavailable(format!("{e:#}"))),
+        },
         p => Arc::new(CliLlm { provider: p, model }),
     })
+}
+
+/// Stands in for a provider that couldn't be set up; every call reports why.
+pub struct Unavailable(pub String);
+
+impl Llm for Unavailable {
+    fn send(&self, _: serde_json::Value) -> Result<serde_json::Value> {
+        bail!("{}", self.0)
+    }
 }
 
 // ---- git ----

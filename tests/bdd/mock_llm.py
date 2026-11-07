@@ -16,6 +16,9 @@ like <repo>, <thread>, <memory> are stripped first):
     a background thread's first task          calls bash `pwd`, then replies "Report: done"
     anything else                             "echo: <text>"
     json_schema requests (nap, handoff)       a valid object for the schema
+    a model whose name contains "notools"    rejects requests with tools, as Ollama does
+
+It also serves Ollama's native API (GET /api/tags, POST /api/chat) over the same script.
 """
 import json, os, re, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +46,11 @@ def call(name, args):
     return [{"id": f"c{time.time_ns()}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]
 
 def respond(body):
+    if "notools" in (body.get("model") or "") and body.get("tools"):
+        return 400, {"error": f"registry.ollama.ai/library/{body['model']} does not support tools"}
+    return 200, script(body)
+
+def script(body):
     msgs = body["messages"]
     system = msgs[0]["content"] if msgs and msgs[0]["role"] == "system" else ""
     m = re.search(r"You are `([^`]+)`", system)
@@ -104,17 +112,52 @@ def respond(body):
         return reply(None, call("bash", {"command": "pwd"}))
     return reply("echo: " + text[:100].replace("\n", " "))
 
+# ---- Ollama's native /api/chat, translated onto the same script
+
+def from_ollama(body):
+    msgs = []
+    for m in body["messages"]:
+        m = dict(m)
+        if m.get("tool_calls"):
+            m["tool_calls"] = [{"id": f"o{i}", "type": "function", "function": {"name": c["function"]["name"],
+                                "arguments": json.dumps(c["function"]["arguments"])}} for i, c in enumerate(m["tool_calls"])]
+        msgs.append(m)
+    req = {"model": body.get("model"), "messages": msgs, "tools": body.get("tools")}
+    fmt = body.get("format")
+    if isinstance(fmt, dict): req["response_format"] = {"type": "json_schema", "json_schema": {"schema": fmt}}
+    elif fmt == "json": req["response_format"] = {"type": "json_object"}
+    return req
+
+def to_ollama(model, r):
+    m = r["choices"][0]["message"]
+    msg = {"role": "assistant", "content": m.get("content") or ""}
+    if m.get("reasoning_content"): msg["thinking"] = m["reasoning_content"]
+    if m.get("tool_calls"):
+        msg["tool_calls"] = [{"function": {"name": c["function"]["name"], "arguments": json.loads(c["function"]["arguments"])}} for c in m["tool_calls"]]
+    return {"model": model, "message": msg, "done": True, "done_reason": "stop", "prompt_eval_count": 100, "eval_count": 10}
+
+def tags():
+    return {"models": [{"name": m, "model": m, "modified_at": f"2026-01-{28 - i:02d}T00:00:00Z", "details": {"parameter_size": "8B"},
+                        "capabilities": ["completion"] + ([] if "notools" in m else ["tools"])} for i, m in enumerate(MODELS)]}
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
-    def send(self, obj):
+    def send(self, obj, status=200):
         data = json.dumps(obj).encode()
-        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_response(status); self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data))); self.end_headers()
         try: self.wfile.write(data)
         except BrokenPipeError: pass
     def do_GET(self):
+        if self.path.startswith("/api/tags"): return self.send(tags())
         self.send({"object": "list", "data": [{"id": m, "created": len(MODELS) - i, "owned_by": "mock"} for i, m in enumerate(MODELS)]})
     def do_POST(self):
-        self.send(respond(json.loads(self.rfile.read(int(self.headers["content-length"])))))
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        if self.path.startswith("/api/chat"):
+            status, r = respond(from_ollama(body))
+            return self.send(to_ollama(body.get("model"), r) if status == 200 else r, status)
+        status, r = respond(body)
+        if status != 200: r = {"error": {"message": r["error"]}}
+        self.send(r, status)
 
 ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

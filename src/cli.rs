@@ -303,7 +303,7 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
                 }
             }
         }
-        Provider::Api => unreachable!("api provider does not use a CLI"),
+        p => unreachable!("{} runs in-process, not through a CLI", p.name()),
     }
     c.current_dir(o.workdir);
     if let Some(m) = o.mcp {
