@@ -1,5 +1,5 @@
 //! `thread mcp`: an MCP stdio server that gives a provider CLI (Claude Code, Codex,
-//! Grok Build) the harness tools: memory, checkpoints, and thread orchestration,
+//! Grok Build, fx) the harness tools: memory, checkpoints, and thread orchestration,
 //! plus `approve`, Claude Code's permission-prompt tool, routed to the REPL.
 //!
 //! The CLI launches it with THREAD_ID / THREAD_DB / THREAD_ROOT in the environment.

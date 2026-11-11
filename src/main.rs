@@ -36,7 +36,7 @@ struct Cli {
     /// Run tools without asking, in every thread
     #[arg(long, global = true)]
     yolo: bool,
-    /// Provider for threads that don't name one: claude | codex | grok | api | ollama | fm | local (default: `thread use`, else first logged in)
+    /// Provider for threads that don't name one: claude | codex | grok | fx | api | ollama | fm | local (default: `thread use`, else first logged in)
     #[arg(long, global = true)]
     provider: Option<String>,
     /// Model for the default provider (/model picks per thread)
@@ -54,7 +54,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Log in: claude, codex or grok (your subscription, via its CLI), api (a key), or set up a local model: ollama, fm, local. No argument: show status
+    /// Log in: claude, codex, grok or fx (your subscription, via its CLI), api (a key), or set up a local model: ollama, fm, local. No argument: show status
     Login { provider: Option<String> },
     /// Show which providers are installed and logged in
     #[command(hide = true)]
@@ -209,6 +209,9 @@ fn real_main() -> Result<()> {
             let p = Provider::parse(provider)?;
             provider::set_default(p)?;
             println!("default provider: {}", p.name());
+            if p == Provider::Fx {
+                provider::register_fx_mcp(&std::env::current_exe()?, true);
+            }
             if !p.status().0 {
                 println!("note: {}", p.status().1);
             }
@@ -217,7 +220,7 @@ fn real_main() -> Result<()> {
         Some(Cmd::Login { provider }) => {
             let Some(name) = provider else {
                 print_status();
-                println!("\nthread login <claude|codex|grok|api|ollama|fm|local>");
+                println!("\nthread login <claude|codex|grok|fx|api|ollama|fm|local>");
                 return Ok(());
             };
             let p = Provider::parse(name)?;
@@ -231,6 +234,10 @@ fn real_main() -> Result<()> {
                     .arg("mcp")
                     .status()
                     .ok();
+            }
+            if p == Provider::Fx {
+                // Same for fx: a profile-scope server in ~/.fx/mcp.json, pointed at this binary.
+                provider::register_fx_mcp(&std::env::current_exe()?, true);
             }
             let (ok, detail) = p.status();
             println!("{} {}: {detail}", if ok { "✓" } else { "✗" }, p.name());
@@ -438,7 +445,7 @@ const HELP: &str = "\
 just type to talk to the focused thread
 y / n                  answer an approval
 /model [name]          show or set this thread's model (`default` to reset)
-/provider [name [model]] show providers, or move this thread (claude, codex, grok, api, ollama, fm, local)
+/provider [name [model]] show providers, or move this thread (claude, codex, grok, fx, api, ollama, fm, local)
 /mcp                   list MCP servers  ·  /mcp add <name> <command…|url>  ·  /mcp rm <name>
 /threads               list threads
 /y /n /always [name|all] answer approvals from any thread (`always`: never ask about that tool again)
@@ -723,7 +730,7 @@ fn handle(conn: &Connection, rt: &Arc<Runtime>, focus: &str, input: &str) -> Res
                         eprintln!("{name:<9} \x1b[2m{}\x1b[0m", target.trim());
                     }
                     eprintln!(
-                        "\x1b[2m/mcp add <name> <command…|url> · /mcp rm <name> — used by claude, codex and grok threads (from their next turn)\x1b[0m"
+                        "\x1b[2m/mcp add <name> <command…|url> · /mcp rm <name> — used by claude, codex, grok and fx threads (from their next turn)\x1b[0m"
                     );
                 }
                 Some("add") => {

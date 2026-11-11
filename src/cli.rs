@@ -1,4 +1,4 @@
-//! Headless turns through the vendor CLIs: `claude -p`, `codex exec`, `grok -p`.
+//! Headless turns through the vendor CLIs: `claude -p`, `codex exec`, `grok -p`, `fx ask`.
 //!
 //! The CLI owns the agent loop (its own tools, its own context management). We give
 //! it the thread's prompt, resume its session on later turns, expose the harness
@@ -20,9 +20,11 @@ pub enum Perms {
     /// Everything runs without asking.
     Yolo,
     /// Ask the user (claude routes prompts to the `approve` MCP tool; codex and grok
-    /// cannot ask headlessly, so they run sandboxed to the working directory).
+    /// cannot ask headlessly, so they run sandboxed to the working directory; fx cannot
+    /// either, so it runs in its `auto` mode, which reviews sensitive actions itself).
     Ask { accept_edits: bool },
-    /// Read-only.
+    /// Read-only. fx has no read-only mode: it runs in `ask` mode, where headless it
+    /// blocks every write and shell command and ends the turn with an error.
     Deny,
 }
 
@@ -38,7 +40,7 @@ pub struct TurnOpts<'a> {
     pub workdir: &'a Path,
     /// Resume this CLI session.
     pub resume: Option<&'a str>,
-    /// Start a new session with this id (claude, grok).
+    /// Start a new session with this id (claude, grok). Codex and fx pick their own.
     pub new_session: Option<&'a str>,
     pub prompt: &'a str,
     /// Appended to the CLI's system prompt (claude). Other CLIs get it in the first prompt.
@@ -303,6 +305,30 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
                 }
             }
         }
+        Provider::Fx => {
+            c = Command::new("fx");
+            // No prompt arguments: fx reads the prompt from stdin.
+            c.args(["ask", "--json"]);
+            if let Some(r) = o.resume {
+                c.args(["--resume-id", r]);
+            } else if o.ephemeral {
+                c.arg("--no-save"); // incompatible with --resume-id
+            }
+            if let Some(m) = o.model {
+                c.args(["--model", m]);
+            }
+            match o.perms {
+                Perms::Yolo => {
+                    c.arg("--full-access");
+                }
+                Perms::Ask { .. } => {
+                    c.arg("--auto");
+                }
+                Perms::Deny => {
+                    c.env("FX_PERMISSION_MODE", "ask");
+                }
+            }
+        }
         p => unreachable!("{} runs in-process, not through a CLI", p.name()),
     }
     c.current_dir(o.workdir);
@@ -316,6 +342,29 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
     (c, stdin_prompt)
 }
 
+/// What the CLI reads on stdin. fx has no output-schema flag, so the schema goes in the prompt.
+fn stdin_text(o: &TurnOpts) -> String {
+    match (o.provider, o.schema) {
+        (Provider::Fx, Some(s)) => format!(
+            "{}\n\nReply with only a JSON object (no prose, no code fence) matching this JSON Schema:\n{s}",
+            o.prompt
+        ),
+        _ => o.prompt.to_string(),
+    }
+}
+
+/// A JSON object in a model's reply, tolerating a code fence or prose around it.
+fn json_in(text: &str) -> Option<Value> {
+    let t = text.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return Some(v);
+    }
+    let (a, b) = (t.find('{')?, t.rfind('}')?);
+    serde_json::from_str::<Value>(t.get(a..=b)?)
+        .ok()
+        .filter(|v| v.is_object())
+}
+
 /// Run one headless turn, streaming parsed events to `on_event`.
 pub fn run(o: &TurnOpts, on_event: &mut dyn FnMut(&Ev), cancel: &AtomicBool) -> Result<Turn> {
     let schema_file = match (o.provider, o.schema) {
@@ -327,6 +376,10 @@ pub fn run(o: &TurnOpts, on_event: &mut dyn FnMut(&Ev), cancel: &AtomicBool) -> 
         }
         _ => None,
     };
+    if let (Provider::Fx, Some(m)) = (o.provider, o.mcp) {
+        // fx has no per-call MCP flag; make sure the harness server is registered with it.
+        crate::provider::register_fx_mcp(&m.exe, false);
+    }
     let (mut cmd, stdin_prompt) = command(o, schema_file.as_deref());
     let bin = o.provider.binary().unwrap();
     let mut child = cmd
@@ -341,7 +394,7 @@ pub fn run(o: &TurnOpts, on_event: &mut dyn FnMut(&Ev), cancel: &AtomicBool) -> 
         .with_context(|| format!("starting `{bin}` (is it installed and on PATH?)"))?;
     if stdin_prompt {
         let mut sin = child.stdin.take().unwrap();
-        let prompt = o.prompt.to_string();
+        let prompt = stdin_text(o);
         std::thread::spawn(move || {
             sin.write_all(prompt.as_bytes()).ok();
         });
@@ -385,12 +438,18 @@ pub fn run(o: &TurnOpts, on_event: &mut dyn FnMut(&Ev), cancel: &AtomicBool) -> 
     }
     let status = child.wait()?;
     let stderr = err_reader.join().unwrap_or_default();
-    parser.finish(&mut turn);
+    for ev in parser.finish(&mut turn) {
+        on_event(&ev);
+    }
     if let Some(f) = schema_file {
         std::fs::remove_file(f).ok();
     }
     if o.schema.is_some() && turn.structured.is_none() {
-        turn.structured = serde_json::from_str(turn.text.trim()).ok();
+        turn.structured = if o.provider == Provider::Fx {
+            json_in(&turn.text)
+        } else {
+            serde_json::from_str(turn.text.trim()).ok()
+        };
     }
     if !status.success() && turn.error.is_none() {
         let tail: String = stderr
@@ -428,7 +487,7 @@ impl Parser {
     }
 
     pub fn line(&mut self, line: &str, turn: &mut Turn) -> Vec<Ev> {
-        if self.provider == Provider::Grok {
+        if matches!(self.provider, Provider::Grok | Provider::Fx) {
             self.grok_lines.push(line.to_string());
             return vec![];
         }
@@ -612,13 +671,9 @@ impl Parser {
         evs
     }
 
-    /// Grok's `--output-format json` prints one object at the end; read it tolerantly.
-    pub fn finish(&mut self, turn: &mut Turn) {
-        if self.provider != Provider::Grok {
-            return;
-        }
-        let obj = self
-            .grok_lines
+    /// The object grok and fx print once at the end (`--output-format json`, `--json`).
+    fn final_object(&self) -> Option<Value> {
+        self.grok_lines
             .iter()
             .rev()
             .find_map(|l| {
@@ -626,13 +681,98 @@ impl Parser {
                     .ok()
                     .filter(|v| v.is_object())
             })
-            .or_else(|| serde_json::from_str::<Value>(&self.grok_lines.join("\n")).ok());
-        let Some(v) = obj else {
+            .or_else(|| serde_json::from_str::<Value>(&self.grok_lines.join("\n")).ok())
+    }
+
+    /// fx's `--json` object: `final_output` (the reply), `output` (all assistant text),
+    /// `session_id`, `exit_code`, `error`, `tool_calls` [{name, status, command_result, error}].
+    fn finish_fx(&mut self, turn: &mut Turn) -> Vec<Ev> {
+        let Some(v) = self.final_object().filter(|v| v.is_object()) else {
+            let raw = self.grok_lines.join("\n");
+            if !raw.trim().is_empty() {
+                turn.error = Some(format!("unexpected output: {}", llm::truncate(&raw, 300)));
+            }
+            return vec![];
+        };
+        let mut evs = vec![];
+        if let Some(s) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
+            turn.session = Some(s.into());
+            evs.push(Ev::Session(s.into()));
+        }
+        for t in v["tool_calls"].as_array().into_iter().flatten() {
+            let name = t["name"].as_str().unwrap_or("?");
+            let cr = &t["command_result"];
+            let input = cr["command"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| t["action"].as_str().map(String::from))
+                .unwrap_or_default();
+            evs.push(Ev::Tool(name.into(), input));
+            let failed =
+                t["status"] != "success" || cr["exit_code"].as_i64().is_some_and(|c| c != 0);
+            let out = ["output", "stdout", "aggregated_output"]
+                .iter()
+                .find_map(|k| cr[k].as_str().map(String::from))
+                .or_else(|| {
+                    (!t["error"].is_null()).then(|| match &t["error"] {
+                        Value::String(s) => s.clone(),
+                        e => e["message"]
+                            .as_str()
+                            .or(e["code"].as_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| e.to_string()),
+                    })
+                })
+                .unwrap_or_default();
+            evs.push(Ev::ToolResult(failed, out));
+        }
+        let text = v["final_output"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .or(v["output"].as_str())
+            .unwrap_or("");
+        if !text.trim().is_empty() {
+            turn.text = text.into();
+            evs.push(Ev::Text(text.into()));
+        }
+        let code = v["exit_code"].as_i64().unwrap_or(0);
+        let err = match &v["error"] {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            e => Some(
+                e["message"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| e.to_string()),
+            ),
+        };
+        if code != 0 || err.is_some() {
+            let e = err.unwrap_or_else(|| format!("fx exited with code {code}"));
+            turn.error = Some(if e == "NonInteractivePermissionRequired" {
+                "fx stopped at an action that needs permission (writes and shell commands are blocked in read-only mode; rerun with --yolo to allow them)".into()
+            } else if turn.text.is_empty() {
+                e
+            } else {
+                format!("{e}: {}", llm::truncate(&turn.text, 300))
+            });
+        }
+        evs
+    }
+
+    /// Grok and fx print one object at the end; read it tolerantly.
+    pub fn finish(&mut self, turn: &mut Turn) -> Vec<Ev> {
+        if self.provider == Provider::Fx {
+            return self.finish_fx(turn);
+        }
+        if self.provider != Provider::Grok {
+            return vec![];
+        }
+        let Some(v) = self.final_object() else {
             let raw = self.grok_lines.join("\n");
             if !raw.trim().is_empty() {
                 turn.text = raw;
             }
-            return;
+            return vec![];
         };
         for k in ["result", "text", "response", "output", "content", "message"] {
             if let Some(s) = v[k].as_str() {
@@ -655,6 +795,7 @@ impl Parser {
         if v["is_error"] == true || v["error"].is_string() {
             turn.error = Some(v["error"].as_str().unwrap_or(&turn.text).to_string());
         }
+        vec![]
     }
 }
 
@@ -720,7 +861,7 @@ mod tests {
         for l in lines {
             evs.extend(parser.line(&l.to_string(), &mut t));
         }
-        parser.finish(&mut t);
+        evs.extend(parser.finish(&mut t));
         (t, evs)
     }
 
@@ -798,6 +939,182 @@ mod tests {
             (t.text.as_str(), t.session.as_deref()),
             ("done", Some("g-2"))
         );
+    }
+
+    #[test]
+    fn fx_final_object() {
+        let (t, evs) = parse(
+            Provider::Fx,
+            &[json!({
+                "output": "Looking.\n\nThere is one file.",
+                "final_output": "There is one file.",
+                "exit_code": 0,
+                "model": "spacexai/grok-4.7",
+                "resolved_provider": "xai",
+                "session_id": "C58MggWDme8z",
+                "steps": 2,
+                "tool_calls": [
+                    {"name": "shell", "status": "success", "command_result": {"command": "ls", "exit_code": 0, "output": "a.txt"}},
+                    {"name": "mcp_thread_remember", "status": "success"},
+                    {"name": "shell", "status": "success", "command_result": {"command": "false", "exit_code": 1}}
+                ],
+                "usage": {"input_tokens": 1200, "output_tokens": null}
+            })],
+        );
+        assert!(t.error.is_none(), "{:?}", t.error);
+        assert_eq!(t.text, "There is one file.");
+        assert_eq!(t.session.as_deref(), Some("C58MggWDme8z"));
+        assert_eq!(
+            evs,
+            vec![
+                Ev::Session("C58MggWDme8z".into()),
+                Ev::Tool("shell".into(), "ls".into()),
+                Ev::ToolResult(false, "a.txt".into()),
+                Ev::Tool("mcp_thread_remember".into(), String::new()),
+                Ev::ToolResult(false, String::new()),
+                Ev::Tool("shell".into(), "false".into()),
+                Ev::ToolResult(true, String::new()),
+                Ev::Text("There is one file.".into()),
+            ]
+        );
+        // diagnostics on stderr never reach the parser; pretty-printed objects still parse
+        let mut p = Parser::new(Provider::Fx);
+        let mut t = Turn::default();
+        for l in serde_json::to_string_pretty(
+            &json!({"final_output": "", "output": "partial", "exit_code": 0, "session_id": "s2"}),
+        )
+        .unwrap()
+        .lines()
+        {
+            p.line(l, &mut t);
+        }
+        p.finish(&mut t);
+        assert_eq!(
+            (t.text.as_str(), t.session.as_deref()),
+            ("partial", Some("s2"))
+        );
+    }
+
+    #[test]
+    fn fx_errors() {
+        // read-only mode: fx blocks the write and ends the turn
+        let (t, evs) = parse(
+            Provider::Fx,
+            &[
+                json!({"final_output": "", "exit_code": 1, "session_id": "", "steps": 0,
+                "tool_calls": [{"name": "read_file", "status": "success"},
+                               {"name": "shell", "status": "error", "action": "run", "error": {"category": "rejected", "code": "rejected"}}],
+                "usage": {"input_tokens": 10, "output_tokens": 3}, "error": "NonInteractivePermissionRequired"}),
+            ],
+        );
+        assert!(t.session.is_none(), "empty session id is ignored");
+        assert!(t.error.as_deref().unwrap().contains("read-only mode"));
+        assert_eq!(evs[3], Ev::ToolResult(true, "rejected".into()));
+        // nonzero exit with no error field keeps the reply in the message
+        let (t, _) = parse(
+            Provider::Fx,
+            &[json!({"final_output": "gateway said no", "exit_code": 2, "session_id": "s3"})],
+        );
+        assert_eq!(
+            t.error.as_deref(),
+            Some("fx exited with code 2: gateway said no")
+        );
+        assert_eq!(t.session.as_deref(), Some("s3"));
+        let (t, _) = parse(
+            Provider::Fx,
+            &[json!({"exit_code": 1, "error": {"message": "rate limited"}})],
+        );
+        assert_eq!(t.error.as_deref(), Some("rate limited"));
+        // not JSON at all
+        let mut p = Parser::new(Provider::Fx);
+        let mut t = Turn::default();
+        p.line("panic: boom", &mut t);
+        p.finish(&mut t);
+        assert!(t.error.unwrap().contains("panic: boom"));
+    }
+
+    #[test]
+    fn fx_command() {
+        let dir = PathBuf::from("/repo");
+        let mcp = McpSpec {
+            exe: "/bin/thread".into(),
+            env: vec![("THREAD_ID".into(), "fix".into())],
+            extra: vec![],
+        };
+        let schema = json!({"type": "object"});
+        let o = |resume, perms, ephemeral| TurnOpts {
+            provider: Provider::Fx,
+            workdir: &dir,
+            resume,
+            new_session: None,
+            prompt: "hi",
+            system_append: None,
+            schema: None,
+            model: Some("openai/gpt-5.6-luna"),
+            mcp: Some(&mcp),
+            perms,
+            ephemeral,
+            no_subagents: true,
+        };
+        let run = |o: &TurnOpts| {
+            let (c, stdin) = command(o, None);
+            let args: Vec<String> = c
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let env: Vec<(String, String)> = c
+                .get_envs()
+                .filter_map(|(k, v)| {
+                    Some((k.to_string_lossy().into(), v?.to_string_lossy().into()))
+                })
+                .collect();
+            (args, env, stdin, c.get_current_dir().map(PathBuf::from))
+        };
+        let has = |a: &[String], w: [&str; 2]| a.windows(2).any(|x| x == w);
+
+        let (a, env, stdin, cwd) = run(&o(None, Perms::Yolo, false));
+        assert_eq!(&a[..2], ["ask", "--json"]);
+        assert!(stdin, "prompt goes on stdin");
+        assert!(!a.contains(&"hi".to_string()) && !a.contains(&"--system".to_string()));
+        assert!(a.contains(&"--full-access".to_string()) && !a.contains(&"--auto".to_string()));
+        assert!(has(&a, ["--model", "openai/gpt-5.6-luna"]));
+        assert!(
+            !a.iter().any(|x| x.starts_with("--resume")),
+            "fx picks the first session id"
+        );
+        assert_eq!(cwd.as_deref(), Some(dir.as_path()));
+        assert!(env.contains(&("THREAD_ID".into(), "fix".into())));
+        assert!(!env.iter().any(|(k, _)| k == "FX_PERMISSION_MODE"));
+
+        let (a, env, ..) = run(&o(
+            Some("C58MggWDme8z"),
+            Perms::Ask { accept_edits: true },
+            false,
+        ));
+        assert!(has(&a, ["--resume-id", "C58MggWDme8z"]) && a.contains(&"--auto".to_string()));
+        assert!(!a.contains(&"--full-access".to_string()));
+        assert!(!env.iter().any(|(k, _)| k == "FX_PERMISSION_MODE"));
+
+        let (a, env, ..) = run(&o(None, Perms::Deny, true));
+        assert!(!a.contains(&"--auto".to_string()) && !a.contains(&"--full-access".to_string()));
+        assert!(env.contains(&("FX_PERMISSION_MODE".into(), "ask".into())));
+        assert!(a.contains(&"--no-save".to_string()));
+        let (a, ..) = run(&o(Some("s"), Perms::Deny, true));
+        assert!(
+            !a.contains(&"--no-save".to_string()),
+            "--no-save can't combine with a resume"
+        );
+
+        let mut with_schema = o(None, Perms::Deny, true);
+        assert_eq!(stdin_text(&with_schema), "hi");
+        with_schema.schema = Some(&schema);
+        let text = stdin_text(&with_schema);
+        assert!(text.starts_with("hi\n\n") && text.ends_with("{\"type\":\"object\"}"));
+        assert_eq!(
+            json_in("```json\n{\"state\": \"done\"}\n```"),
+            Some(json!({"state": "done"}))
+        );
+        assert_eq!(json_in("no json"), None);
     }
 
     #[test]

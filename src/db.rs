@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS threads (
   messages    TEXT NOT NULL DEFAULT '[]',        -- the live conversation, append-only
   prefix      TEXT NOT NULL DEFAULT '',          -- text owed to the next user message (nap distillate)
   trusted     INTEGER NOT NULL DEFAULT 0,        -- background tools run without approval
-  provider    TEXT NOT NULL DEFAULT '',        -- claude | codex | grok | api
+  provider    TEXT NOT NULL DEFAULT '',        -- claude | codex | grok | fx | api
   session     TEXT,                              -- the provider CLI's session id, for resume
   model       TEXT,                              -- per-thread model override
   created_at  INTEGER NOT NULL,

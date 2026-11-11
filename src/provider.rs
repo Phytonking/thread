@@ -1,5 +1,5 @@
 //! Providers. Subscription logins are used by driving each vendor's official CLI
-//! headlessly (Claude Code, Codex, Grok Build), so auth stays in those tools.
+//! headlessly (Claude Code, Codex, Grok Build, fx), so auth stays in those tools.
 //! `api` is the fallback: any OpenAI-compatible endpoint with a key.
 //! `ollama`, `fm` (Apple Foundation Models) and `local` (LM Studio, llama.cpp, vLLM…)
 //! run on this machine through the same in-process agent loop as `api`, no key needed.
@@ -15,16 +15,18 @@ pub enum Provider {
     Claude,
     Codex,
     Grok,
+    Fx,
     Api,
     Ollama,
     Fm,
     Local,
 }
 
-pub const ALL: [Provider; 7] = [
+pub const ALL: [Provider; 8] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Grok,
+    Provider::Fx,
     Provider::Api,
     Provider::Ollama,
     Provider::Fm,
@@ -32,7 +34,7 @@ pub const ALL: [Provider; 7] = [
 ];
 
 /// Names accepted wherever a provider is chosen (tool enums, help text).
-pub const NAMES: &str = "claude, codex, grok, api, ollama, fm, local";
+pub const NAMES: &str = "claude, codex, grok, fx, api, ollama, fm, local";
 
 impl Provider {
     pub fn parse(s: &str) -> Result<Self> {
@@ -40,6 +42,7 @@ impl Provider {
             "claude" | "anthropic" | "claude-code" => Provider::Claude,
             "codex" | "openai" | "chatgpt" => Provider::Codex,
             "grok" | "xai" => Provider::Grok,
+            "fx" | "fx.sh" | "fxsh" => Provider::Fx,
             "api" | "key" | "anthropic-api" => Provider::Api,
             "ollama" => Provider::Ollama,
             "fm" | "apple" | "afm" | "foundation-models" => Provider::Fm,
@@ -54,6 +57,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Grok => "grok",
+            Provider::Fx => "fx",
             Provider::Api => "api",
             Provider::Ollama => "ollama",
             Provider::Fm => "fm",
@@ -67,6 +71,7 @@ impl Provider {
             Provider::Claude => Some("claude"),
             Provider::Codex => Some("codex"),
             Provider::Grok => Some("grok"),
+            Provider::Fx => Some("fx"),
             _ => None,
         }
     }
@@ -178,6 +183,19 @@ impl Provider {
                     (false, "not logged in — thread login grok".into())
                 }
             }
+            Provider::Fx => {
+                if !self.installed() {
+                    return (false, "not installed — https://fx.sh/docs".into());
+                }
+                match Command::new("fx").arg("status").output() {
+                    Ok(o) => fx_auth_status(&format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    )),
+                    Err(e) => (false, e.to_string()),
+                }
+            }
             Provider::Api => {
                 let (base, key) = api_config();
                 match (key, is_local(&base)) {
@@ -233,6 +251,7 @@ impl Provider {
             Provider::Claude => ("claude", &["auth", "login"]),
             Provider::Codex => ("codex", &["login"]),
             Provider::Grok => ("grok", &["login"]),
+            Provider::Fx => ("fx", &["login"]),
             Provider::Api => return login_api_key(),
             Provider::Ollama => {
                 if which("ollama").is_none() && !reachable(&format!("{}/api/tags", ollama_host())) {
@@ -819,7 +838,12 @@ pub fn resolve_default(flag: Option<&str>) -> Result<Provider> {
     if let Some(c) = read_json("config.json")["provider"].as_str() {
         return Provider::parse(c);
     }
-    for p in [Provider::Claude, Provider::Codex, Provider::Grok] {
+    for p in [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Grok,
+        Provider::Fx,
+    ] {
         if p.installed() && p.status().0 {
             return Ok(p);
         }
@@ -832,7 +856,7 @@ pub fn resolve_default(flag: Option<&str>) -> Result<Provider> {
         return Ok(Provider::Ollama);
     }
     bail!(
-        "no provider is logged in. Run `thread login claude` (or codex, grok), `thread login api` for an API key, or `thread use ollama|fm|local` for a local model"
+        "no provider is logged in. Run `thread login claude` (or codex, grok, fx), `thread login api` for an API key, or `thread use ollama|fm|local` for a local model"
     )
 }
 
@@ -877,6 +901,17 @@ pub fn mcp_add(name: &str, target: &[String]) -> Result<()> {
         }
         c.output().ok();
     }
+    // Same for fx: its profile-scope servers (~/.fx/mcp.json) start without a trust prompt.
+    if Provider::Fx.installed() {
+        let mut c = Command::new("fx");
+        c.args(["mcp", "add"]);
+        if let Some(url) = spec["url"].as_str() {
+            c.args(["--transport", "http", name, url]);
+        } else {
+            c.arg(name).args(target);
+        }
+        c.output().ok();
+    }
     Ok(())
 }
 
@@ -889,6 +924,12 @@ pub fn mcp_remove(name: &str) -> Result<bool> {
     write_json("mcp.json", &cfg, false)?;
     if Provider::Grok.installed() {
         Command::new("grok")
+            .args(["mcp", "remove", name])
+            .output()
+            .ok();
+    }
+    if Provider::Fx.installed() {
+        Command::new("fx")
             .args(["mcp", "remove", name])
             .output()
             .ok();
@@ -948,6 +989,7 @@ pub fn models(p: Provider, refresh: bool) -> (Vec<ModelOpt>, bool, i64) {
         Provider::Claude => claude_live(),
         Provider::Codex => codex_live(),
         Provider::Grok => grok_live(),
+        Provider::Fx => fx_live(),
         Provider::Api => api_live(),
         Provider::Ollama => ollama_live(),
         Provider::Fm => {
@@ -1102,6 +1144,107 @@ fn grok_live() -> Vec<ModelOpt> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `fx models` prints `[models] N available` then one ` - <id>` line per model.
+fn fx_live() -> Vec<ModelOpt> {
+    if !Provider::Fx.installed() {
+        return vec![];
+    }
+    Command::new("fx")
+        .arg("models")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let list = parse_fx_models(&out);
+            if list.is_empty() {
+                parse_fx_models(&String::from_utf8_lossy(&o.stderr))
+            } else {
+                list
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn parse_fx_models(out: &str) -> Vec<ModelOpt> {
+    out.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("- "))
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && !id.contains(' '))
+        .map(|id| opt(id, ""))
+        .collect()
+}
+
+/// Read `fx status` lines (`[status] auth=…`, `auth_expired=…`, `auth_refreshable=…`).
+/// An expired login that fx can refresh still works, so it counts as logged in.
+fn fx_auth_status(out: &str) -> (bool, String) {
+    let field = |k: &str| {
+        out.split_whitespace()
+            .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    let auth = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("[status] auth="))
+        .map(|v| v.trim().to_string());
+    let expired = field("auth_expired").as_deref() == Some("true");
+    let refreshable = field("auth_refreshable").as_deref() == Some("true");
+    match auth {
+        Some(a)
+            if !a.is_empty()
+                && !matches!(
+                    a.to_lowercase().as_str(),
+                    "none" | "missing" | "unauthenticated" | "not configured"
+                ) =>
+        {
+            if expired && !refreshable {
+                (false, format!("login expired ({a}) — thread login fx"))
+            } else {
+                let team = field("team")
+                    .map(|t| format!(", team {t}"))
+                    .unwrap_or_default();
+                (true, format!("logged in ({a}{team})"))
+            }
+        }
+        _ => (
+            false,
+            "not logged in — thread login fx (or `fx setup` for a gateway key)".into(),
+        ),
+    }
+}
+
+/// fx has no per-call MCP flag: register the harness server in its profile config
+/// (~/.fx/mcp.json), where servers start with no trust prompt and inherit the env
+/// of `fx ask`, so THREAD_ID etc. reach it per thread. `replace` re-points an
+/// existing entry at this binary; otherwise an existing entry is left alone.
+pub fn register_fx_mcp(exe: &std::path::Path, replace: bool) {
+    if !Provider::Fx.installed() {
+        return;
+    }
+    if fx_mcp_registered() {
+        if !replace {
+            return;
+        }
+        Command::new("fx")
+            .args(["mcp", "remove", "thread"])
+            .output()
+            .ok();
+    }
+    Command::new("fx")
+        .args(["mcp", "add", "thread"])
+        .arg(exe)
+        .arg("mcp")
+        .output()
+        .ok();
+}
+
+fn fx_mcp_registered() -> bool {
+    home()
+        .and_then(|h| std::fs::read_to_string(h.join(".fx").join("mcp.json")).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|v| v["mcp"]["thread"].is_object())
 }
 
 /// `GET {base}/models`, the OpenAI-compatible model list, newest first.
@@ -1268,6 +1411,8 @@ mod tests {
     fn parse_and_uuid() {
         assert_eq!(Provider::parse("ChatGPT").unwrap(), Provider::Codex);
         assert_eq!(Provider::parse("xai").unwrap(), Provider::Grok);
+        assert_eq!(Provider::parse("fx.sh").unwrap(), Provider::Fx);
+        assert_eq!(Provider::parse("FX").unwrap(), Provider::Fx);
         assert!(Provider::parse("gemini").is_err());
         let u = uuid();
         assert_eq!(u.len(), 36);
@@ -1294,6 +1439,40 @@ mod tests {
         }
         assert!(Provider::Ollama.is_local_model() && !Provider::Api.is_local_model());
         assert!(Provider::Api.in_process() && !Provider::Claude.in_process());
+    }
+
+    #[test]
+    fn fx_status_and_models() {
+        let ok = "[status] model=spacexai/grok-4.7\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=t-1\n";
+        let (yes, detail) = fx_auth_status(ok);
+        assert!(yes, "{detail}");
+        assert_eq!(detail, "logged in (fx login, team t-1)");
+        assert!(
+            fx_auth_status(
+                "[status] auth=fx login\n[status] auth_expired=true auth_refreshable=true"
+            )
+            .0,
+            "expired but refreshable still works"
+        );
+        assert!(!fx_auth_status("[status] auth=fx login\n[status] auth_expired=true\n").0);
+        assert!(!fx_auth_status("[status] auth=none\n").0);
+        assert!(!fx_auth_status("[status] model=x\n").0);
+        let ms = parse_fx_models(
+            "[models] 3 available\n - anthropic/claude-sonnet-5.5\n - openai/gpt-5.6-luna\n - spacexai/grok-4.7\n",
+        );
+        assert_eq!(
+            ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [
+                "anthropic/claude-sonnet-5.5",
+                "openai/gpt-5.6-luna",
+                "spacexai/grok-4.7"
+            ]
+        );
+        assert_eq!(
+            resolve_in(Provider::Fx, &ms, true, "grok").unwrap(),
+            "spacexai/grok-4.7"
+        );
+        assert!(resolve_in(Provider::Fx, &ms, true, "gemini").is_err());
     }
 
     #[test]

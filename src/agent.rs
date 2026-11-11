@@ -54,7 +54,7 @@ You can do work yourself with bash and the editor, and you can run work in backg
 When to spawn a background thread (`spawn_thread`): self-contained work that takes more than a few steps and does not need the user turn by turn: implementing a feature, chasing a bug, running and fixing a test suite, an investigation or review. \
 Give it a short kebab-case name the user can recognize and type (e.g. fix-login-redirect), and a complete task description with everything it needs, since it cannot see this conversation. \
 Use `worktree: true` when it will edit code, so it works on its own branch (thread/<name>) without colliding with other threads. \
-Each thread can run on its own provider (claude, codex, grok, api, or a local model: ollama, fm, local) and model: honour what the user asks for (\"have codex do it\", \"use opus for the review\"), otherwise use `default` for both. `set_thread_model` moves an existing thread. \
+Each thread can run on its own provider (claude, codex, grok, fx, api, or a local model: ollama, fm, local) and model: honour what the user asks for (\"have codex do it\", \"use opus for the review\"), otherwise use `default` for both. `set_thread_model` moves an existing thread. \
 Do small things (a quick question, a one-line fix, reading a file) yourself. \
 Background threads exist only through `spawn_thread`: never substitute another subagent, task or parallel-agent tool for it. If `spawn_thread` fails, tell the user the exact error instead of working around it.
 
@@ -709,7 +709,15 @@ impl<'a> Agent<'a> {
         let system = self.system();
         let system_append = (self.provider == Provider::Claude).then_some(system.as_str());
         let prompt = if first && self.provider != Provider::Claude {
-            format!("<harness_instructions>\n{system}\n</harness_instructions>\n\n{prompt}")
+            // fx defers MCP tools behind `capability_search` and names them mcp_<server>_<tool>.
+            let tools_note = if self.provider == Provider::Fx {
+                "\n\nThe harness tools named above (remember, checkpoint, notify_main, spawn_thread, …) come from the `thread` MCP server; in fx they are called mcp_thread_<name> (e.g. mcp_thread_remember). Use capability_search to load them before the first call."
+            } else {
+                ""
+            };
+            format!(
+                "<harness_instructions>\n{system}{tools_note}\n</harness_instructions>\n\n{prompt}"
+            )
         } else {
             prompt.to_string()
         };
