@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS threads (
   provider    TEXT NOT NULL DEFAULT '',        -- claude | codex | grok | fx | api
   session     TEXT,                              -- the provider CLI's session id, for resume
   model       TEXT,                              -- per-thread model override
+  zone        TEXT NOT NULL DEFAULT '',          -- launch dir it is confined to (see zone.rs)
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
@@ -144,6 +145,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     }
     if !cols.iter().any(|c| c == "model") {
         conn.execute_batch("ALTER TABLE threads ADD COLUMN model TEXT")?;
+    }
+    if !cols.iter().any(|c| c == "zone") {
+        conn.execute_batch("ALTER TABLE threads ADD COLUMN zone TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
 }

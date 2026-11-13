@@ -50,13 +50,15 @@ pub fn serve() -> Result<()> {
                 let name = msg["params"]["name"].as_str().unwrap_or("");
                 let args = msg["params"]["arguments"].clone();
                 let (text, is_error) = if name == "approve" {
-                    (approve(&conn, &thread_id, interactive, &args), false)
+                    (approve(&conn, &thread, interactive, &args), false)
                 } else {
+                    let (workdir, zone) = Ctx::place(&thread);
                     let ctx = Ctx {
                         conn: &conn,
                         run_id: threads::live_run(&conn, &thread_id)?.unwrap_or_default(),
                         thread_id: thread_id.clone(),
-                        workdir: thread.workdir.clone().into(),
+                        workdir,
+                        zone,
                         own_worktree: thread.branch.is_some(),
                         approval: Approval::Allow, // harness tools have no side effects outside the db
                         rt: None,
@@ -94,12 +96,22 @@ fn list(is_main: bool) -> Vec<Value> {
 /// Claude Code permission-prompt contract: reply {"behavior":"allow","updatedInput":…} or {"behavior":"deny","message":…}.
 fn approve(
     conn: &rusqlite::Connection,
-    thread_id: &str,
+    thread: &threads::Thread,
     interactive: bool,
     args: &Value,
 ) -> String {
+    let thread_id = thread.id.as_str();
     let tool = args["tool_name"].as_str().unwrap_or("a tool");
     let input = args["input"].clone();
+    // A file outside the thread's zone is refused before anyone is asked.
+    let (workdir, zone) = Ctx::place(thread);
+    for k in ["file_path", "path", "notebook_path"] {
+        if let Some(p) = input[k].as_str()
+            && let Err(e) = zone.check(&workdir, std::path::Path::new(p))
+        {
+            return json!({"behavior": "deny", "message": format!("{e:#}")}).to_string();
+        }
+    }
     // our own tools are pre-allowed (--allowedTools); this catches any that still get routed here
     if tool.starts_with("mcp__thread__")
         || crate::cli::READ_ONLY_TOOLS.contains(&tool)

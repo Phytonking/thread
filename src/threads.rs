@@ -26,9 +26,12 @@ pub struct Thread {
     pub provider: String,
     pub session: Option<String>,
     pub model: Option<String>,
+    /// The directory `thread` was opened in when this thread was created: its file access
+    /// is confined to it (and its worktree). See `zone`.
+    pub zone: String,
 }
 
-const COLS: &str = "id, title, kind, status, task, workdir, branch, parent_id, state, trusted, updated_at, provider, session, model";
+const COLS: &str = "id, title, kind, status, task, workdir, branch, parent_id, state, trusted, updated_at, provider, session, model, zone";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Thread> {
     Ok(Thread {
@@ -46,6 +49,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Thread> {
         provider: r.get(11)?,
         session: r.get(12)?,
         model: r.get(13)?,
+        zone: r.get(14)?,
     })
 }
 
@@ -223,6 +227,21 @@ pub fn set_model(conn: &Connection, id: &str, model: Option<&str>) -> Result<()>
         "UPDATE threads SET model = ?2 WHERE id = ?1",
         params![id, model],
     )?;
+    Ok(())
+}
+
+pub fn set_zone(conn: &Connection, id: &str, zone: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE threads SET zone = ?2 WHERE id = ?1",
+        params![id, zone],
+    )?;
+    Ok(())
+}
+
+/// Give threads without a zone (main on first launch, threads from before zones) this one.
+/// A thread that has a zone keeps it, wherever `thread` is opened later.
+pub fn adopt_zone(conn: &Connection, zone: &str) -> Result<()> {
+    conn.execute("UPDATE threads SET zone = ?1 WHERE zone = ''", [zone])?;
     Ok(())
 }
 

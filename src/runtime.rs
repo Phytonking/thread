@@ -789,15 +789,25 @@ pub fn create_thread(
     model: Option<&str>,
 ) -> Result<threads::Thread> {
     let name = threads::unique_name(conn, name)?;
+    let parent_t = threads::get(conn, parent).ok();
+    // A thread inherits its parent's zone (so it holds for threads spawned from a resumed main
+    // and from the MCP server alike); without one it gets the repo root.
+    let zone = match &parent_t {
+        Some(p) if !p.zone.is_empty() => p.zone.clone(),
+        _ => crate::zone::Zone::new([root.to_path_buf()])
+            .root()
+            .display()
+            .to_string(),
+    };
     let (workdir, branch) = if worktree && is_git(root) {
         let (dir, branch) = add_worktree(root, &name)?;
         (dir.display().to_string(), Some(branch))
     } else {
-        (root.display().to_string(), None)
+        // shares the zone itself (the repo root may lie outside it)
+        (zone.clone(), None)
     };
     // "default" means the parent's provider: a codex main spawns codex threads. (Before, they
     // landed on the user's default but kept the parent's model, which that provider can't run.)
-    let parent_t = threads::get(conn, parent).ok();
     let provider = match &parent_t {
         Some(p) if provider.is_empty() => p.provider.clone(),
         _ => provider.to_string(),
@@ -811,6 +821,8 @@ pub fn create_thread(
         Some(parent),
         &provider,
     )?;
+    threads::set_zone(conn, &name, &zone)?;
+    t.zone = zone;
     // An explicit model wins; otherwise, on the parent's provider, inherit its /model choice.
     if model.is_some() {
         threads::set_model(conn, &name, model)?;
@@ -930,6 +942,84 @@ mod tests {
         // another provider never carries the parent's model over
         let t = create_thread(&conn, &root, "other", "", false, MAIN, "claude", None).unwrap();
         assert_eq!((t.provider.as_str(), t.model.as_deref()), ("claude", None));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resumed_threads_keep_their_zone() {
+        let root = tmp_root();
+        let first = crate::zone::resolve(&root.join("app")).unwrap();
+        let later = crate::zone::resolve(&root.join("elsewhere")).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&later).unwrap();
+        let db_path = root.join(".thread/thread.db");
+        // first launch, from app/
+        let conn = db::open(&db_path).unwrap();
+        threads::ensure_main(&conn, &root.display().to_string()).unwrap();
+        threads::adopt_zone(&conn, &first.display().to_string()).unwrap();
+        let t = create_thread(&conn, &root, "child", "", false, MAIN, "", None).unwrap();
+        assert_eq!(t.zone, first.display().to_string());
+        assert_eq!(
+            t.workdir, t.zone,
+            "a thread without a worktree works in the zone"
+        );
+        drop(conn);
+        // relaunch from elsewhere/: nothing moves, and new threads inherit main's zone
+        let conn = db::open(&db_path).unwrap();
+        threads::ensure_main(&conn, &root.display().to_string()).unwrap();
+        threads::adopt_zone(&conn, &later.display().to_string()).unwrap();
+        for id in [MAIN, "child"] {
+            let t = threads::get(&conn, id).unwrap();
+            assert_eq!(t.zone, first.display().to_string(), "{id}");
+            let (cwd, z) = crate::tools::Ctx::place(&t);
+            assert_eq!(cwd, first, "{id} runs commands in its own zone");
+            assert!(z.check(&cwd, &later.join("x")).is_err());
+        }
+        let t = create_thread(&conn, &root, "late", "", false, MAIN, "", None).unwrap();
+        assert_eq!(t.zone, first.display().to_string());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn worktree_threads_reach_their_worktree_and_zone_only() {
+        let root = crate::zone::resolve(&tmp_root()).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        // opened in a subdirectory: the worktree (under the repo root) lies outside the zone dir
+        let sub = root.join("app");
+        std::fs::create_dir_all(&sub).unwrap();
+        let conn = db::open(&root.join(".thread/thread.db")).unwrap();
+        threads::ensure_main(&conn, &root.display().to_string()).unwrap();
+        threads::adopt_zone(&conn, &sub.display().to_string()).unwrap();
+        let t = create_thread(&conn, &root, "wt", "", true, MAIN, "", None).unwrap();
+        let wt = PathBuf::from(&t.workdir);
+        assert!(t.branch.is_some() && wt.is_dir());
+        let (cwd, z) = crate::tools::Ctx::place(&t);
+        assert_eq!(cwd, wt);
+        assert!(z.check(&cwd, Path::new("src/new.rs")).is_ok());
+        assert!(z.check(&cwd, &sub.join("a.txt")).is_ok());
+        assert!(z.check(&cwd, &root.join("README")).is_err());
+        assert!(z.check(&cwd, Path::new("../other-thread/x")).is_err());
+        // git in the worktree commits into the repo's .git, so the sandbox lets it write there
+        assert_eq!(crate::zone::git_common_dir(&wt), Some(root.join(".git")));
+        assert!(
+            z.writable(&[])
+                .iter()
+                .any(|w| root.join(".git").starts_with(w))
+        );
+        remove_worktree(&root, &t.workdir).ok();
         std::fs::remove_dir_all(&root).ok();
     }
 

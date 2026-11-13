@@ -6,6 +6,7 @@
 
 use crate::llm::{self, Llm};
 use crate::provider::Provider;
+use crate::zone::{self, Zone};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -38,6 +39,8 @@ pub struct McpSpec {
 pub struct TurnOpts<'a> {
     pub provider: Provider,
     pub workdir: &'a Path,
+    /// Confine the CLI's writes to this zone (its own sandbox for codex, sandbox-exec otherwise).
+    pub zone: Option<&'a Zone>,
     /// Resume this CLI session.
     pub resume: Option<&'a str>,
     /// Start a new session with this id (claude, grok). Codex and fx pick their own.
@@ -116,6 +119,10 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
             }
             if let Some(s) = o.system_append {
                 c.args(["--append-system-prompt", s]);
+            }
+            if sandboxed(o) {
+                // Claude Code's own bash sandbox can't nest inside ours.
+                c.args(["--settings", r#"{"sandbox":{"enabled":false}}"#]);
             }
             if let Some(s) = o.schema {
                 c.args(["--json-schema", &s.to_string()]);
@@ -200,19 +207,38 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
             if let Some(f) = schema_file {
                 c.arg("--output-schema").arg(f);
             }
-            match o.perms {
-                Perms::Yolo => {
+            // Codex sandboxes its own commands (seatbelt can't nest, so it isn't wrapped): with a
+            // zone, writes go to the workspace and the zone's other writable roots, even with --yolo.
+            match (o.perms, o.zone) {
+                (Perms::Yolo, None) => {
                     c.arg("--dangerously-bypass-approvals-and-sandbox");
                 }
-                Perms::Ask { .. } => {
+                (Perms::Yolo | Perms::Ask { .. }, _) => {
                     c.args([
                         "-c",
                         "sandbox_mode=\"workspace-write\"",
                         "-c",
                         "approval_policy=\"never\"",
                     ]);
+                    if o.perms == Perms::Yolo {
+                        c.args(["-c", "sandbox_workspace_write.network_access=true"]);
+                    }
+                    if let Some(z) = o.zone {
+                        let roots: Vec<String> = z
+                            .writable(&[])
+                            .iter()
+                            .map(|p| toml_str(&p.display().to_string()))
+                            .collect();
+                        c.args([
+                            "-c",
+                            &format!(
+                                "sandbox_workspace_write.writable_roots=[{}]",
+                                roots.join(",")
+                            ),
+                        ]);
+                    }
                 }
-                Perms::Deny => {
+                (Perms::Deny, _) => {
                     c.args([
                         "-c",
                         "sandbox_mode=\"read-only\"",
@@ -337,9 +363,68 @@ pub fn command(o: &TurnOpts, schema_file: Option<&Path>) -> (Command, bool) {
             c.env(k, v);
         }
     }
+    if sandboxed(o)
+        && let Some(z) = o.zone
+    {
+        c = zone::wrap(c, &cli_rules(o, z));
+    }
     // own process group: Ctrl-C at the REPL must not kill a thread's turn
     std::os::unix::process::CommandExt::process_group(&mut c, 0);
     (c, stdin_prompt)
+}
+
+/// Whether the whole CLI process runs under the zone's sandbox. Codex sandboxes its own
+/// commands to the zone instead; grok's `--sandbox` modes do too (but `--always-approve` doesn't).
+fn sandboxed(o: &TurnOpts) -> bool {
+    o.zone.is_some()
+        && zone::sandbox_available()
+        && match o.provider {
+            Provider::Claude | Provider::Fx => true,
+            Provider::Grok => o.perms == Perms::Yolo,
+            _ => false,
+        }
+}
+
+/// What a sandboxed CLI may write: the zone, plus its own state and credentials, and the
+/// harness database (its `thread mcp` server runs inside the sandbox too). Its user-level
+/// settings stay read-only: hooks written there would run outside the sandbox later.
+fn cli_rules(o: &TurnOpts, z: &Zone) -> zone::Rules {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let mut extra = vec![home.join("Library/Caches"), home.join("Library/Keychains")];
+    let mut write_prefix = vec![];
+    let mut deny = vec![];
+    match o.provider {
+        Provider::Claude => {
+            extra.push(home.join(".claude"));
+            extra.push(home.join(".local/state/claude"));
+            extra.push(home.join(".local/share/claude"));
+            write_prefix.push(home.join(".claude.json"));
+            for f in ["settings.json", "settings.local.json", "CLAUDE.md", "hooks"] {
+                deny.push(home.join(".claude").join(f));
+            }
+        }
+        Provider::Fx => {
+            extra.push(home.join(".fx"));
+            for f in ["settings.json", "mcp.json"] {
+                deny.push(home.join(".fx").join(f));
+            }
+        }
+        Provider::Grok => extra.push(home.join(".grok")),
+        _ => {}
+    }
+    // the harness db (and, for main, the worktrees it spawns threads into)
+    if let Some(db) = o
+        .mcp
+        .and_then(|m| m.env.iter().find(|(k, _)| k == "THREAD_DB"))
+        .and_then(|(_, v)| Path::new(v).parent().map(Path::to_path_buf))
+    {
+        extra.push(db);
+    }
+    zone::Rules {
+        write: z.writable(&extra),
+        write_prefix,
+        deny,
+    }
 }
 
 /// What the CLI reads on stdin. fx has no output-schema flag, so the schema goes in the prompt.
@@ -825,6 +910,7 @@ impl Llm for CliLlm {
         let o = TurnOpts {
             provider: self.provider,
             workdir: &dir,
+            zone: None,
             resume: None,
             new_session: None,
             prompt: &prompt,
@@ -1045,6 +1131,7 @@ mod tests {
         let o = |resume, perms, ephemeral| TurnOpts {
             provider: Provider::Fx,
             workdir: &dir,
+            zone: None,
             resume,
             new_session: None,
             prompt: "hi",
@@ -1134,6 +1221,7 @@ mod tests {
         let base = |p, resume, perms| TurnOpts {
             provider: p,
             workdir: &dir,
+            zone: None,
             resume,
             new_session: Some("u-1"),
             prompt: "hi",
@@ -1207,5 +1295,81 @@ mod tests {
             a.windows(2).any(|w| w == ["-s", "u-1"])
                 && a.windows(2).any(|w| w == ["--sandbox", "read-only"])
         );
+    }
+
+    #[test]
+    fn zoned_cli_turns_stay_sandboxed_under_yolo() {
+        let dir = std::env::temp_dir().join(format!("thread-cli-zone-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let z = Zone::new([dir.clone()]);
+        let o = |p, perms| TurnOpts {
+            provider: p,
+            workdir: &dir,
+            zone: Some(&z),
+            resume: None,
+            new_session: None,
+            prompt: "hi",
+            system_append: None,
+            schema: None,
+            model: None,
+            mcp: None,
+            perms,
+            ephemeral: false,
+            no_subagents: false,
+        };
+        let cmd = |o: &TurnOpts| {
+            let (c, _) = command(o, None);
+            let prog = c.get_program().to_string_lossy().into_owned();
+            let args: Vec<String> = c
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            (prog, args, c.get_current_dir().map(PathBuf::from))
+        };
+        // codex: its own sandbox, never the bypass, with the zone's writable roots
+        let (prog, a, _) = cmd(&o(Provider::Codex, Perms::Yolo));
+        assert_eq!(prog, "codex");
+        assert!(!a.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(a.contains(&"sandbox_mode=\"workspace-write\"".to_string()));
+        assert!(a.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        let roots = a
+            .iter()
+            .find(|x| x.starts_with("sandbox_workspace_write.writable_roots="))
+            .unwrap();
+        // (here the zone sits in the temp dir, so the temp root covers it)
+        assert!(
+            z.writable(&[])
+                .iter()
+                .all(|w| roots.contains(&w.display().to_string())),
+            "{roots}"
+        );
+        // claude and fx: the whole CLI under sandbox-exec, in the zone
+        if zone::sandbox_available() {
+            for p in [Provider::Claude, Provider::Fx] {
+                let (prog, a, cwd) = cmd(&o(p, Perms::Yolo));
+                assert_eq!(prog, "/usr/bin/sandbox-exec", "{p:?}");
+                assert_eq!(a[2], "-D");
+                assert!(a.contains(&p.binary().unwrap().to_string()));
+                let writable = a
+                    .iter()
+                    .filter_map(|x| x.strip_prefix('W')?.split_once('='));
+                assert!(
+                    writable.clone().any(|(_, w)| z.root().starts_with(w)),
+                    "{a:?}"
+                );
+                assert!(
+                    writable
+                        .clone()
+                        .any(|(_, w)| w.ends_with("/.claude") || w.ends_with("/.fx"))
+                );
+                assert_eq!(cwd.as_deref(), Some(dir.as_path()));
+            }
+            let (_, a, _) = cmd(&o(Provider::Claude, Perms::Yolo));
+            assert!(
+                a.iter()
+                    .any(|x| x.contains("\"sandbox\":{\"enabled\":false}"))
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

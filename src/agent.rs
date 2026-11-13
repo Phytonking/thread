@@ -235,16 +235,21 @@ impl<'a> Agent<'a> {
     }
 
     fn system(&self) -> String {
-        if self.is_main() {
+        let (workdir, zone) = Ctx::place(&self.thread);
+        let base = if self.is_main() {
             main_system(&self.root)
         } else {
             background_system(
                 &self.root,
                 &self.thread.id,
-                &self.thread.workdir,
+                &workdir.display().to_string(),
                 self.thread.branch.as_deref(),
             )
-        }
+        };
+        format!(
+            "{base}\n\nYour zone is {}: you may read, write, create, delete or move files only inside it. The harness refuses file access outside it, and shell commands run in it.",
+            zone.describe()
+        )
     }
 
     pub fn has_pending(&self) -> bool {
@@ -384,16 +389,18 @@ impl<'a> Agent<'a> {
     }
 
     fn ctx(&self, run_id: &str) -> Ctx<'_> {
+        let (workdir, zone) = Ctx::place(&self.thread);
         Ctx {
             conn: self.conn,
             run_id: run_id.to_string(),
             thread_id: self.thread.id.clone(),
-            workdir: self.thread.workdir.clone().into(),
+            workdir,
             own_worktree: self.thread.branch.is_some(),
             approval: self.approval,
             rt: self.rt.clone(),
             cancel: self.cancel.clone(),
             root: self.root.clone().into(),
+            zone,
         }
     }
 
@@ -721,11 +728,12 @@ impl<'a> Agent<'a> {
         } else {
             prompt.to_string()
         };
-        let workdir = std::path::PathBuf::from(&self.thread.workdir);
+        let (workdir, zone) = Ctx::place(&self.thread);
         let model = self.current_model();
         let opts = TurnOpts {
             provider: self.provider,
             workdir: &workdir,
+            zone: Some(&zone),
             resume: self.thread.session.as_deref(),
             new_session: new_session.as_deref(),
             prompt: &prompt,

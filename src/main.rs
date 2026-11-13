@@ -12,6 +12,7 @@ mod provider;
 mod runtime;
 mod threads;
 mod tools;
+mod zone;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -253,6 +254,9 @@ fn real_main() -> Result<()> {
     let db_path = root.join(".thread").join("thread.db");
     let conn = db::open(&db_path)?;
     threads::ensure_main(&conn, &root.display().to_string())?;
+    // The zone: where `thread` was opened. Threads that already have one keep theirs.
+    let launch_zone = zone::resolve(&std::env::current_dir()?)?;
+    threads::adopt_zone(&conn, &launch_zone.display().to_string())?;
 
     let model_flag = cli
         .model
@@ -326,6 +330,14 @@ fn real_main() -> Result<()> {
     match cmd {
         Cmd::Open { name } => {
             let start = threads::find(&conn, &name)?;
+            if Path::new(&start.zone) != launch_zone {
+                eprintln!(
+                    "\x1b[2m{} keeps its zone {} (opened here: {})\x1b[0m",
+                    start.id,
+                    start.zone,
+                    launch_zone.display()
+                );
+            }
             repl(&conn, &runtime(true)?, &start.id)?;
         }
         Cmd::Ls { all } => print_list(&conn, None, all)?,

@@ -5,6 +5,7 @@
 //!   can `notify_main` before they finish
 
 use crate::runtime::Runtime;
+use crate::zone::{self, Zone};
 use crate::{consolidate, memory, threads};
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
@@ -42,6 +43,16 @@ pub struct Ctx<'a> {
     pub cancel: Arc<AtomicBool>,
     /// Repo root (where worktrees for new threads are created).
     pub root: PathBuf,
+    /// Where the thread may touch files. Checked before approval, so it holds under --yolo.
+    pub zone: Zone,
+}
+
+impl Ctx<'_> {
+    /// The workdir and zone for a thread: commands start in its workdir if that is in the zone.
+    pub fn place(t: &threads::Thread) -> (PathBuf, Zone) {
+        let zone = Zone::for_thread(t);
+        (zone.cwd(Path::new(&t.workdir)), zone)
+    }
 }
 
 pub fn definitions(is_main: bool) -> Value {
@@ -195,10 +206,16 @@ fn bash(ctx: &Ctx, input: &Value) -> Result<String> {
     if !read_only(cmd) {
         approve(ctx, &format!("bash `{}`", crate::llm::truncate(cmd, 200)))?;
     }
-    let mut child = Command::new("bash")
-        .arg("-c")
+    // Runs in the zone, and on macOS under a sandbox that denies writes outside it.
+    let mut sh = Command::new("bash");
+    sh.arg("-c")
         .arg(cmd)
-        .current_dir(&ctx.workdir)
+        .current_dir(ctx.zone.cwd(&ctx.workdir));
+    let rules = zone::Rules {
+        write: ctx.zone.writable(&[]),
+        ..Default::default()
+    };
+    let mut child = zone::wrap(sh, &rules)
         .process_group(0) // Ctrl-C at the REPL must not kill a thread's command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -279,17 +296,13 @@ pub fn read_only(cmd: &str) -> bool {
     }
 }
 
-fn resolve(ctx: &Ctx, p: &str) -> PathBuf {
-    let p = Path::new(p);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        ctx.workdir.join(p)
-    }
+/// The real path the editor will touch (`..` and symlinks resolved), if it is in the zone.
+fn resolve(ctx: &Ctx, p: &str) -> Result<PathBuf> {
+    ctx.zone.check(&ctx.workdir, Path::new(p))
 }
 
 fn editor(ctx: &Ctx, input: &Value) -> Result<String> {
-    let path = resolve(ctx, s(input, "path")?);
+    let path = resolve(ctx, s(input, "path")?)?;
     match s(input, "command")? {
         "view" => {
             if path.is_dir() {
@@ -383,7 +396,8 @@ fn list_dir(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) -> Res
         let rel = p.strip_prefix(root).unwrap_or(&p).display().to_string();
         if p.is_dir() {
             out.push(format!("{rel}/"));
-            if depth < 1 {
+            // not into symlinked dirs: they may point out of the zone
+            if depth < 1 && e.file_type().is_ok_and(|t| !t.is_symlink()) {
                 list_dir(root, &p, depth + 1, out)?;
             }
         } else {
@@ -627,24 +641,85 @@ mod tests {
 
     fn ctx<'a>(conn: &'a Connection, dir: &Path, approval: Approval) -> Ctx<'a> {
         threads::ensure_main(conn, &dir.display().to_string()).unwrap();
+        threads::adopt_zone(conn, &dir.display().to_string()).unwrap();
         let run = threads::start_run(conn, "main").unwrap();
+        let (workdir, zone) = Ctx::place(&threads::get(conn, "main").unwrap());
         Ctx {
             conn,
             run_id: run,
             thread_id: "main".into(),
-            workdir: dir.to_path_buf(),
+            workdir,
             own_worktree: false,
             approval,
             rt: None,
             cancel: Arc::new(AtomicBool::new(false)),
             root: dir.to_path_buf(),
+            zone,
         }
     }
 
     fn tmpdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("thread-test-{}", db::new_id()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        zone::resolve(&d).unwrap()
+    }
+
+    fn edit(c: &Ctx, input: Value) -> (String, bool) {
+        run(c, "str_replace_based_edit_tool", &input)
+    }
+
+    #[test]
+    fn editor_refuses_paths_outside_the_zone_even_with_yolo() {
+        let conn = db::open_memory();
+        let base = tmpdir();
+        let dir = base.join("zone");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(base.join("secret.txt"), "top secret\n").unwrap();
+        std::os::unix::fs::symlink(&base, dir.join("up")).unwrap();
+        let c = ctx(&conn, &dir, Approval::Allow);
+        let (out, e) = edit(
+            &c,
+            json!({"command": "create", "path": "ok/new.txt", "file_text": "x"}),
+        );
+        assert!(!e, "{out}");
+        for (cmd, path) in [
+            ("view", "../secret.txt"),
+            ("view", base.join("secret.txt").to_str().unwrap()),
+            ("view", "up/secret.txt"),
+            ("create", "../new.txt"),
+            ("create", "up/new.txt"),
+            ("create", "/etc/thread-zone-test"),
+        ] {
+            let (out, e) = edit(&c, json!({"command": cmd, "path": path, "file_text": "x"}));
+            assert!(
+                e && out.contains("outside this thread's zone"),
+                "{cmd} {path}: {out}"
+            );
+        }
+        let (out, e) = edit(
+            &c,
+            json!({"command": "str_replace", "path": "up/secret.txt", "old_str": "top", "new_str": "no"}),
+        );
+        assert!(e && out.contains("outside"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(base.join("secret.txt")).unwrap(),
+            "top secret\n"
+        );
+        assert!(!base.join("new.txt").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn bash_runs_in_the_zone() {
+        let conn = db::open_memory();
+        let base = tmpdir();
+        let dir = base.join("zone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = ctx(&conn, &dir, Approval::Allow);
+        c.workdir = base.clone(); // a workdir outside the zone is not where commands run
+        let (out, e) = run(&c, "bash", &json!({"command": "pwd -P"}));
+        assert!(!e && out.trim() == dir.display().to_string(), "{out}");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -708,7 +783,7 @@ mod tests {
             "str_replace_based_edit_tool",
             &json!({"command": "create", "path": "../escape.txt", "file_text": "x"}),
         );
-        assert!(e, "edits outside the worktree still need approval");
+        assert!(e, "edits outside the worktree are refused");
         std::fs::remove_dir_all(&dir).ok();
     }
 
