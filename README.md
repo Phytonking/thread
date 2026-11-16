@@ -72,3 +72,7 @@ Ask main for work in plain English. `/switch <name>` watches a thread, `/main` g
 | [Configuration](docs/configuration.md) | every environment variable and config file |
 | [Architecture](docs/architecture.md) | runtime model, persistence, code layout, known gaps |
 | [Contributing](CONTRIBUTING.md) | build, test, conventions, and how to add a provider or scenario |
+
+## License
+
+[MIT](LICENSE)
